@@ -7,7 +7,7 @@ import { callModel } from "./model.mjs";
 
 export const AGENTS = {
   reader: {
-    system: "You extract structure from an academic manuscript. Return JSON only: {claims:[{text,location}], theories:[{name,originator,location}], quotes:[{text,location}], citations:[strings], references:[strings], method, equations:[strings], tables:[strings]}. If something is not in the text, use an empty list, never invent it.",
+    system: "You extract structure from an academic manuscript. Return JSON only: {claims:[{text,location}], theories:[{name,originator,location}], quotes:[{text,location}], citations:[strings], method, equations:[strings], tables:[strings]}. If something is not in the text, use an empty list, never invent it. Do NOT return a reference list: references are parsed from the document tail by deterministic code, not by you, so a list you guess would corrupt citation matching.",
     model: "muse-spark-1.3",
   },
   citation_matcher: {

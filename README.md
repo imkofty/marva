@@ -51,13 +51,23 @@ detail panels. No plagiarism percentage anywhere.
   pipeline). Endpoints: `POST /jobs`, `GET /jobs/:id`,
   `GET /jobs/:id/events`, `GET /jobs/:id/report.json`,
   `/report.html`, `/report.pdf`, `POST /jobs/:id/confirm`,
-  `DELETE /jobs/:id`, `GET /demo/synthetic`. Tests 7/7 pass.
+  `DELETE /jobs/:id`, `GET /demo/synthetic`. Tests 10/10 pass.
   - Agents: Reader, Citation Matcher, Reference Verifier, Gap Assessor,
     Journal Matcher, Supervisor + Report Builder, Narrator (silent).
-  - Citation matching is deterministic code (author-year keys),
-    never a model. Reference verification: Spark bulk, Wonder only
-    for flagged ambiguous cases; a model answer never upgrades a
-    reference to "verified". Only a Crossref DOI match is "verified";
+  - Citation pipeline (deterministic code, never a model): the PDF
+    extractor parses Tj/TJ operators in stream order and marks true
+    superscript numbers; the reference list is parsed from the
+    document tail (numbered lists keyed by number, author-year
+    lists line-based), never supplied by the model; citations are
+    scanned from the body only (author-year, bracket ranges/groups,
+    marked superscript). The Reader runs chunked over the full body,
+    not just the first 20,000 characters. If no reference list is
+    found, or a numbered list has neither bracket nor marked
+    superscript citations, citation checking is skipped honestly
+    and its dimension is not scored — bare numbers are never
+    treated as citations. Reference verification: Spark bulk, Wonder
+    only for flagged ambiguous cases; a model answer never upgrades
+    a reference to "verified". Only a Crossref DOI match is "verified";
     an OpenAlex title match is a "candidate".
 - `docs/` — architecture, honesty limits, how to run.
 - `examples/` — synthetic demo manuscripts only. Never a real unpublished manuscript.

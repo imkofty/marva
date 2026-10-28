@@ -29,6 +29,7 @@
 // POSTs arriving in the same instant could both pass the lock check;
 // this is a demo limitation, not a guarantee for production.
 import { extractReferenceKey, normalizeKey } from "./citation-matcher.mjs";
+import { parseReferences, scanAuthorYearCitations, scanBracketCitations, scanSuperscriptCitations, splitMarkedBody, stripMarkerChars } from "./reference-parser.mjs";
 import { runAgent, escalateAmbiguous } from "./agents.mjs";
 import { extractTextFromPdf } from "./pdf.mjs";
 import { verifyReference, searchStrengthening } from "./strengthening.mjs";
@@ -58,6 +59,54 @@ async function pushEvent(env, job, event) {
   job.events.push(event);
   if (event.status === "failed" || event.status === "skipped") job.partial = true;
   await saveJob(env, job);
+}
+
+// Chunk body text at paragraph boundaries so a long paper's claims are
+// read in full, not just its first 20,000 characters. Chunking happens
+// only in the Reader stage, while the manuscript text is in memory;
+// text is never persisted to KV, so later stages cannot re-chunk it.
+function chunkText(text, maxChars = 30000) {
+  const lines = String(text || "").split(/\n/);
+  const chunks = [];
+  let cur = "";
+  for (const line of lines) {
+    if (cur.length + line.length + 1 > maxChars && cur.trim()) { chunks.push(cur); cur = ""; }
+    if (line.length > maxChars) {
+      for (let i = 0; i < line.length; i += maxChars) chunks.push(line.slice(i, i + maxChars));
+    } else {
+      cur += (cur ? "\n" : "") + line;
+    }
+  }
+  if (cur.trim()) chunks.push(cur);
+  return chunks.length ? chunks : [String(text || "")];
+}
+
+function mergeReader(acc, data) {
+  if (!data) return acc;
+  const out = acc || { claims: [], theories: [], quotes: [], citations: [], method: null, equations: [], tables: [] };
+  const dedup = (arr, key) => {
+    const seen = new Set((arr || []).map((x) => String(typeof x === "string" ? x : (x?.[key] ?? x?.text ?? JSON.stringify(x))).toLowerCase()));
+    return (v) => {
+      const k = String(typeof v === "string" ? v : (v?.[key] ?? v?.text ?? JSON.stringify(v))).toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    };
+  };
+  const claimOk = dedup(out.claims, "text");
+  for (const c of data.claims || []) if (claimOk(c)) out.claims.push(c);
+  const theoryOk = dedup(out.theories, "name");
+  for (const t of data.theories || []) if (theoryOk(t)) out.theories.push(t);
+  const quoteOk = dedup(out.quotes, "text");
+  for (const q of data.quotes || []) if (quoteOk(q)) out.quotes.push(q);
+  const citOk = dedup(out.citations, null);
+  for (const c of data.citations || []) if (citOk(c)) out.citations.push(c);
+  if (!out.method && data.method) out.method = data.method;
+  const eqOk = dedup(out.equations, null);
+  for (const e of data.equations || []) if (eqOk(e)) out.equations.push(e);
+  const tabOk = dedup(out.tables, null);
+  for (const t of data.tables || []) if (tabOk(t)) out.tables.push(t);
+  return out;
 }
 
 function base64ToBuffer(b64) {
@@ -147,35 +196,120 @@ export async function runStage(env, job, stage, text, deps = {}) {
   const agentDeps = { fetchImpl, apiKey: hasKey ? apiKey : "" };
   if (stage === "reader") {
     if (text) {
-      if (!hasKey) {
-        await pushEvent(env, job, { stage: "reader", status: "skipped", detail: "MODEL_API_KEY not set" });
+      // Deterministic parsing first, model second. References come
+      // from the document tail parser, never from the model; citations
+      // come from code scanning the BODY (never the reference zone),
+      // unioned with whatever the Reader model reports.
+      const plainText = stripMarkerChars(text);
+      const parsed = parseReferences(plainText);
+      const plainBody = parsed.body && parsed.body.trim() ? parsed.body : plainText;
+      const scanned = {
+        author_year: scanAuthorYearCitations(plainBody),
+        bracket: scanBracketCitations(plainBody),
+        superscript: scanSuperscriptCitations(splitMarkedBody(text)),
+      };
+      job.scanned_citations = scanned;
+      const providedCitations = job.citations || [];
+      const providedReferences = job.references || [];
+      if (parsed.status === "parsed") {
+        job.references = parsed.entries;
+        job.reference_keys = parsed.keys;
+        job.reference_style = parsed.style;
+        job.citation_status = "parsed";
+        job.citation_note = null;
+      } else if (providedReferences.length > 0) {
+        job.reference_keys = null;
+        job.reference_style = null;
+        job.citation_status = "provided";
+        job.citation_note = null;
       } else {
-        const reader = await runAgent("reader", { text: text.slice(0, 20000) }, agentDeps);
-        if (reader.data) {
-          job.reader = reader.data;
-          if (Array.isArray(reader.data.citations)) job.citations = reader.data.citations;
-          if (Array.isArray(reader.data.references)) job.references = reader.data.references;
-          await pushEvent(env, job, { stage: "reader", status: "done", detail: `Claims: ${reader.data.claims?.length ?? 0}, citations: ${job.citations.length}, references: ${job.references.length}` });
+        job.references = [];
+        job.reference_keys = null;
+        job.reference_style = null;
+        job.citation_status = "skipped_no_references";
+        job.citation_note = parsed.note;
+      }
+      const scannedAll = [...new Set([...scanned.author_year, ...scanned.bracket, ...scanned.superscript])];
+      if (!hasKey) {
+        job.citations = [...new Set([...providedCitations, ...scannedAll])];
+        await pushEvent(env, job, { stage: "reader", status: "skipped", detail: `MODEL_API_KEY not set. References parsed by code: ${job.references.length}, citations scanned by code: ${scannedAll.length}` });
+      } else {
+        const chunks = chunkText(plainBody);
+        let merged = null;
+        let failed = 0;
+        for (const chunk of chunks) {
+          const reader = await runAgent("reader", { text: chunk }, agentDeps);
+          if (reader.data) merged = mergeReader(merged, reader.data);
+          else failed++;
+        }
+        if (merged) {
+          job.reader = merged;
+          job.citations = [...new Set([...providedCitations, ...scannedAll, ...(merged.citations || [])])];
+          job.reader_chunks = { total: chunks.length, failed };
+          if (failed > 0) job.reader_chunks_failed = failed;
+          await pushEvent(env, job, { stage: "reader", status: "done", detail: `Claims: ${merged.claims?.length ?? 0}, citations: ${job.citations.length}, references: ${job.references.length}, chunks: ${chunks.length}${failed ? `, failed chunks: ${failed}` : ""}` });
         } else {
-          await pushEvent(env, job, { stage: "reader", status: "failed", detail: reader.error || "Reader failed" });
+          await pushEvent(env, job, { stage: "reader", status: "failed", detail: "Reader failed on every chunk" });
         }
       }
     } else {
+      job.citation_status = (job.references || []).length > 0 ? "provided" : "skipped_no_references";
+      if (job.citation_status === "skipped_no_references") job.citation_note = "No reference list was found in the document. Citation checking was skipped; this dimension is not scored.";
       await pushEvent(env, job, { stage: "reader", status: "done", detail: "Text split into sections" });
     }
     return;
   }
   if (stage === "citation_matcher") {
-    // Deterministic, never a model. Reader returns full reference
-    // strings ("Davis, 1989. Perceived usefulness...") while in-text
-    // citations are keys ("Davis, 1989"): matching full strings against
-    // keys falsely reports every citation as missing, so compare
-    // author-year keys extracted by regex, originals kept for the
-    // verifier/report. Same fix as backend-node run-job.mjs.
-    job.reference_keys = (job.references || []).map(extractReferenceKey);
-    job.result = _origMatch((job.citations || []).map(normalizeKey), job.reference_keys);
-    job.result.uncited_references = (job.references || []).filter((r) => job.result.uncited.includes(extractReferenceKey(r)));
-    await pushEvent(env, job, { stage: "citation_matcher", status: "done", detail: `Missing: ${job.result.missing.length}, uncited: ${job.result.uncited.length}, duplicates: ${job.result.duplicates.length}`, result: job.result });
+    // Deterministic, never a model. Mode is chosen from what was
+    // actually found, never guessed:
+    //  - author-year list -> match author-year keys.
+    //  - numeric list + bracket citations -> match numbers.
+    //  - numeric list + marked superscript -> match marked numbers.
+    //  - numeric list + neither -> SKIP honestly. Bare numbers in
+    //    plain text cannot be told apart from page numbers, years
+    //    and counts, so matching them would manufacture findings.
+    //  - no references at all -> SKIP with skipped_no_references.
+    const refs = job.references || [];
+    if (refs.length === 0) {
+      job.citation_status = "skipped_no_references";
+      job.citation_note = job.citation_note || "No reference list was found in the document. Citation checking was skipped; this dimension is not scored.";
+      job.result = { missing: [], uncited: [], duplicates: [], status: "skipped_no_references", note: job.citation_note };
+      await pushEvent(env, job, { stage: "citation_matcher", status: "skipped", detail: job.citation_note, result: job.result });
+      return;
+    }
+    const scanned = job.scanned_citations || {};
+    let citedKeys, listedKeys, mode;
+    if (job.reference_keys && job.reference_style === "numeric") {
+      listedKeys = job.reference_keys;
+      if ((scanned.bracket || []).length > 0) { mode = "numeric-bracket"; citedKeys = scanned.bracket; }
+      else if ((scanned.superscript || []).length > 0) { mode = "numeric-superscript"; citedKeys = scanned.superscript; }
+      else {
+        job.citation_status = "skipped_superscript_unparsed";
+        job.citation_note = "Citation checking was skipped: the reference list is numbered, but no bracketed citations and no marked superscript citations were found in the text, and bare numbers cannot be told apart from page numbers, years and counts. This dimension is not scored for citation matching; reference database checks still ran.";
+        job.result = { missing: [], uncited: [], duplicates: [], status: "skipped_superscript_unparsed", note: job.citation_note };
+        await pushEvent(env, job, { stage: "citation_matcher", status: "skipped", detail: job.citation_note, result: job.result });
+        return;
+      }
+    } else if (job.reference_keys && job.reference_style === "author-year") {
+      listedKeys = job.reference_keys;
+      const ayFromJob = (job.citations || []).map(normalizeKey).filter((k) => /,\s*(19|20)\d{2}$/.test(k));
+      citedKeys = [...new Set([...(scanned.author_year || []), ...ayFromJob])];
+      mode = "author-year";
+    } else {
+      listedKeys = refs.map(extractReferenceKey);
+      citedKeys = (job.citations || []).map(normalizeKey);
+      mode = "author-year";
+    }
+    const matched = _origMatch(citedKeys, listedKeys);
+    job.result = { ...matched, status: "done", mode };
+    if (mode.startsWith("numeric")) {
+      job.result.uncited_references = refs.filter((r, idx) => matched.uncited.includes(listedKeys[idx]));
+    } else {
+      job.result.uncited_references = refs.filter((r) => matched.uncited.includes(extractReferenceKey(r)));
+    }
+    job.citation_status = "done";
+    job.citation_note = null;
+    await pushEvent(env, job, { stage: "citation_matcher", status: "done", detail: `Missing: ${matched.missing.length}, uncited: ${matched.uncited.length}, duplicates: ${matched.duplicates.length} (mode: ${mode})`, result: job.result });
     return;
   }
   if (stage === "reference_verifier") {

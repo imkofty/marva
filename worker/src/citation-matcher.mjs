@@ -15,9 +15,11 @@ export function normalizeKey(key) {
 // fuzzy similarity. If no author-year pattern is found, the normalized
 // full string is the key, so nothing is silently dropped.
 export function extractReferenceKey(ref) {
-  const m = String(ref).trim().match(/^([^,;]+),\s*(\d{4})\b/);
+  // Strip a leading list marker ("- ", "12. ") before the surname.
+  const cleaned = String(ref).trim().replace(/^[-•*]\s+/, "").replace(/^\d{1,3}\.\s+/, "");
+  const m = cleaned.match(/^([^,;]+),\s*(\d{4})\b/);
   if (m) return `${m[1].trim().toLowerCase()}, ${m[2]}`;
-  return normalizeKey(ref);
+  return normalizeKey(cleaned);
 }
 
 export function matchCitations(inText, referenceList) {

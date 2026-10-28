@@ -9,6 +9,14 @@ import { mapDiagnosticToDimensions } from "./dimensions.mjs";
 export function buildReport(job) {
   const r = job.result || {};
   const confirmed = job.confirmed === true;
+  const limitations = [
+    "MARVA does not guarantee acceptance at any journal.",
+    "Unverified references and journals are labelled unverified, never certain.",
+    "The author confirms every reference before it enters a bibliography.",
+  ];
+  if (job.citation_note) limitations.push(job.citation_note);
+  if (job.reader_chunks_failed) limitations.push(`The Reader could not read ${job.reader_chunks_failed} of ${job.reader_chunks?.total ?? "?"} text sections, so claims in those sections are not covered in this report.`);
+  if (job.reference_style) limitations.push(`Reference list parsed by deterministic code (style: ${job.reference_style}${r.mode ? `, citation matching mode: ${r.mode}` : ""}); the model did not supply the reference list.`);
   return {
     product: "MARVA",
     jobId: job.id,
@@ -20,7 +28,7 @@ export function buildReport(job) {
       : "Final report held until the author confirms references: the author must review and confirm every reference (POST /jobs/:id/confirm) before this report is treated as final. Confirmation records the author's review; it does not verify a reference or a journal by itself.",
     diagnostic: job.supervisor || null,
     dimensions: mapDiagnosticToDimensions(job),
-    citation_flags: { missing: r.missing || [], uncited: r.uncited || [], duplicates: r.duplicates || [] },
+    citation_flags: { missing: r.missing || [], uncited: r.uncited || [], duplicates: r.duplicates || [], status: r.status || job.citation_status || null, mode: r.mode || null, note: job.citation_note || null, reference_style: job.reference_style || null, reference_count: (job.references || []).length },
     reader_summary: job.reader ? { claims: job.reader.claims?.length ?? 0, theories: job.reader.theories?.length ?? 0, quotes: job.reader.quotes?.length ?? 0 } : null,
     verifier: job.verifier || null,
     gap: job.gap || null,
@@ -42,11 +50,7 @@ export function buildReport(job) {
     fixes: job.supervisor?.fixes || [],
     quality_gate: job.quality_gate || null,
     partial: !!job.partial,
-    limitations: [
-      "MARVA does not guarantee acceptance at any journal.",
-      "Unverified references and journals are labelled unverified, never certain.",
-      "The author confirms every reference before it enters a bibliography.",
-    ],
+    limitations,
     ai_disclosure: "This report was produced by an automated pre-submission audit. The author remains responsible for all revisions.",
   };
 }
