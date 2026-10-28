@@ -1,0 +1,20 @@
+# MARVA backend-node on Render — free tier, no paid dependency.
+# Deploy: connect this repo (or a repo containing backend-node/) to
+# Render, or run `render` from this directory. The server listens on
+# $PORT (Render sets it automatically) and needs no build step.
+# MODEL_API_KEY and SCOPUS_API_KEY are set in the Render dashboard
+# as secret env vars (sync: false); they are never in this file.
+services:
+  - type: web
+    name: marva-backend-node
+    env: node
+    plan: free
+    rootDir: backend-node
+    buildCommand: "echo 'no build step: Node stdlib only'"
+    startCommand: "node src/server.mjs"
+    healthCheckPath: /demo/synthetic
+    envVars:
+      - key: MODEL_API_KEY
+        sync: false
+      - key: SCOPUS_API_KEY
+        sync: false
