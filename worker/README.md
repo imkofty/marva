@@ -94,6 +94,12 @@ PDF, same shape as the Node backend), `POST /jobs/:id/confirm
 manuscript text, a plagiarism percentage, an unverified reference
 written as certain, or a journal written as Scopus-indexed when its
 status is unverified. Limitations text is always included.
+Journal recommendations come from `src/journal-evidence.mjs`
+(OpenAlex works in the classified fields, grouped by journal;
+Scopus status always `unverified` in the Worker, no Scopus key).
+When strengthening or journal recommendations are empty, the report
+carries `recommendation_notes` saying so honestly, instead of a
+blank space.
 
 ## Synthetic demo
 

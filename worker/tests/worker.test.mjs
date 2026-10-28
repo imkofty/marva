@@ -203,6 +203,21 @@ test("Report JSON/HTML/PDF + confirm gate + delete, no key", async () => {
   } finally { globalThis.fetch = orig; }
 });
 
+test("Journal evidence from OpenAlex + honest empty-recommendation notes", async () => {
+  const { buildJournalRecommendations } = await import("../src/journal-evidence.mjs");
+  const { buildReport } = await import("../src/export.mjs");
+  const fakeFetch = async () => ({ ok: true, json: async () => ({ results: [{ title: "Field work", authorships: [{ author: { display_name: "A. Test" } }], publication_year: 2022, primary_location: { source: { display_name: "Test Journal" } }, doi: "https://doi.org/10.1234/fieldwork" }] }) });
+  const ev = await buildJournalRecommendations([{ name: "Agricultural technology" }], fakeFetch);
+  assert.equal(ev.recommendations.length, 1);
+  assert.equal(ev.recommendations[0].journal, "Test Journal");
+  assert.equal(ev.recommendations[0].scopus_indexed_status, "unverified");
+  assert.equal(ev.recommendations[0].verification, "candidate");
+  // Empty recommendations must produce honest notes, not a blank space.
+  const emptyReport = buildReport({ id: "t", status: "done", confirmed: false, supervisor: { diagnostic: [], fixes: [] }, result: {}, journal_recommendations: [], strengthening: { recommendations: [] } });
+  assert.ok(emptyReport.recommendation_notes.length >= 2);
+  assert.ok(emptyReport.recommendation_notes.join(" ").includes("verified enough"));
+});
+
 test("404, 400, and runJob export", async () => {
   const env = makeEnv("");
   const res404 = await worker.fetch(new Request("https://worker.test/jobs/nope"), env, {});

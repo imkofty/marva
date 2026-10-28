@@ -27,6 +27,18 @@ export function buildReport(job) {
     journal: job.journal || null,
     journal_recommendations: job.journal_recommendations || [],
     strengthening_references: job.strengthening ? job.strengthening.recommendations || [] : null,
+    // Honest empty-result notes: an empty recommendation list is a
+    // real outcome (search failed, or no candidate verified enough),
+    // never a bug to hide and never a reason to invent a journal or
+    // a reference. The UI shows these notes instead of a blank space.
+    recommendation_notes: [
+      ...((job.strengthening && (job.strengthening.recommendations || []).length === 0)
+        ? ["No strengthening reference was verified enough to show in this job. Candidates that could not be verified were dropped, never shown as certain."]
+        : []),
+      ...((job.journal_recommendations || []).length === 0
+        ? ["No journal recommendation was verified enough to show in this job. Journals are listed only when a recent OpenAlex work in a classified field names them; Scopus status is always unverified unless a Scopus check really returns a match."]
+        : []),
+    ],
     fixes: job.supervisor?.fixes || [],
     quality_gate: job.quality_gate || null,
     partial: !!job.partial,

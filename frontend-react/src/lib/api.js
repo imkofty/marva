@@ -1,13 +1,13 @@
 // MARVA frontend API layer — honest-data rules live here, not in the UI.
 // API base comes from the build env VITE_API_BASE. The default is the
-// placeholder named in the spec (filled in at deploy time); it is NOT
-// a claim that this backend exists today. The live backend today is a
-// Cloudflare Worker, whose URL is set via VITE_API_BASE at deploy.
+// live Cloudflare Worker backend. There is deliberately NO fallback to
+// any other host: a build with a wrong VITE_API_BASE must fail loudly
+// against the live backend, never silently hit a dead backend.
 // No content is ever invented here: every finding, percentage and log
 // line comes from a backend response, or is labelled as a local error.
 
 export const API_BASE =
-  import.meta.env.VITE_API_BASE || "https://marva-backend.onrender.com";
+  import.meta.env.VITE_API_BASE || "https://marva-backend-worker.imkofty.workers.dev";
 
 // The 7 agents, in pipeline order. `stage` is the backend event stage
 // name; `progress` is the mockup Audit Progress stage it feeds, or null
@@ -136,17 +136,38 @@ export async function fetchSyntheticDemo() {
   return getJson(`/demo/synthetic`);
 }
 
-// Export buttons call the backend report endpoints. If the backend
-// does not implement them yet it returns 404, and the caller must say
-// so honestly instead of generating a fake report locally.
+// Export buttons call the backend report endpoints (JSON, HTML, PDF),
+// all implemented on the live Worker. If the backend returns an error,
+// the caller must say so honestly instead of generating a fake report
+// locally. PDF is returned as a Blob so the caller can download it.
 export async function downloadReport(jobId, kind) {
-  const path = kind === "html" ? `/jobs/${jobId}/report.html` : `/jobs/${jobId}/report.json`;
+  const path =
+    kind === "html" ? `/jobs/${jobId}/report.html`
+    : kind === "pdf" ? `/jobs/${jobId}/report.pdf`
+    : `/jobs/${jobId}/report.json`;
   const res = await fetch(`${API_BASE}${path}`);
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`GET ${path} ${res.status}: ${text.slice(0, 200)}`);
   }
+  if (kind === "pdf") return res.blob();
   return kind === "html" ? res.text() : res.json();
+}
+
+// Author Confirmation Gate: POST /jobs/:id/confirm {confirmed:true}.
+// Confirmation records the author's review; it does not verify a
+// reference or a journal by itself.
+export async function confirmJob(jobId) {
+  const res = await fetch(`${API_BASE}/jobs/${jobId}/confirm`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirmed: true }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`POST /jobs/${jobId}/confirm ${res.status}: ${text.slice(0, 200)}`);
+  }
+  return res.json();
 }
 
 export async function deleteJob(jobId) {

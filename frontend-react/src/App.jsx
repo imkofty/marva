@@ -10,6 +10,7 @@ import {
   fetchJob,
   fetchSyntheticDemo,
   downloadReport,
+  confirmJob,
   deleteJob,
   fileToBase64,
 } from "./lib/api";
@@ -190,7 +191,13 @@ export default function App() {
     }
     try {
       const data = await downloadReport(jobId, kind);
-      if (kind === "html") {
+      if (kind === "pdf") {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(data);
+        a.download = `marva-report-${jobId}.pdf`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      } else if (kind === "html") {
         const blob = new Blob([data], { type: "text/html" });
         const a = document.createElement("a");
         a.href = URL.createObjectURL(blob);
@@ -207,9 +214,29 @@ export default function App() {
       }
       setNotice(`Export ${kind.toUpperCase()} downloaded.`);
     } catch (e) {
-      // Honest failure: the backend report endpoint is not implemented
-      // yet on the live Worker, so say so instead of faking a report.
+      // Honest failure: say so instead of faking a report locally.
       setNotice(`Export failed: ${e.message}. The full report below (from GET /jobs/:id) is still available.`);
+    }
+  };
+
+  // Author Confirmation Gate: the report is held until the author
+  // confirms the references. After confirming, re-fetch the job so
+  // the report below shows the confirmed state without a manual refresh.
+  const onConfirm = async () => {
+    if (!jobId) {
+      setNotice("No job selected: start an audit or open a history entry first.");
+      return;
+    }
+    setBusy(true);
+    try {
+      await confirmJob(jobId);
+      const job = await fetchJob(jobId);
+      setReport(job.report || job);
+      setNotice("References confirmed. The report is now final — confirmation records your review; it does not verify a reference or a journal by itself.");
+    } catch (e) {
+      setNotice(`Confirmation failed: ${e.message}. The report is still held.`);
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -228,7 +255,7 @@ export default function App() {
       setNotice("Job deleted on the backend and removed from history.");
     } catch (e) {
       setNotice(
-        `Backend delete failed: ${e.message}. The backend delete endpoint is not implemented yet, so the job was NOT deleted server-side. Use "Remove from this browser's history" to clear only the local entry.`
+        `Backend delete failed: ${e.message}. The job was NOT deleted server-side. Use "Remove from this browser's history" to clear only the local entry.`
       );
     }
   };
@@ -392,6 +419,7 @@ export default function App() {
           <div className="marva-actions">
             <button className="marva-btn" onClick={() => onExport("json")}>Export JSON</button>{" "}
             <button className="marva-btn" onClick={() => onExport("html")}>Export HTML</button>{" "}
+            <button className="marva-btn" onClick={() => onExport("pdf")}>Export PDF</button>{" "}
             <button className="marva-btn marva-btn-danger" onClick={onDelete}>Delete job</button>{" "}
             <button className="marva-btn marva-btn-secondary" onClick={removeLocal}>
               Remove from this browser's history
@@ -402,7 +430,121 @@ export default function App() {
         <section className="marva-card marva-report-card">
           <h2>Report</h2>
           {report ? (
-            <pre className="marva-report">{JSON.stringify(report, null, 2)}</pre>
+            <>
+              {jobId && report.held_until_confirmation && (
+                <div className="marva-notice" role="alert">
+                  <strong>Report held until you confirm the references.</strong>{" "}
+                  Review the citation flags and references below, then confirm.
+                  Confirmation records your review; it does not verify a
+                  reference or a journal by itself.
+                  <div style={{ marginTop: 8 }}>
+                    <button className="marva-btn" onClick={onConfirm} disabled={busy}>
+                      {busy ? "Confirming…" : "Confirm references"}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {jobId && report.confirmed && (
+                <p className="marva-meta">
+                  ✓ References confirmed by the author. The report below is final.
+                </p>
+              )}
+              {Array.isArray(report.findings) && report.findings.length > 0 && (
+                <>
+                  <h3>Findings (synthetic demo)</h3>
+                  <ul>
+                    {report.findings.map((f, i) => (
+                      <li key={i}>{f.finding}</li>
+                    ))}
+                  </ul>
+                  <p className="marva-meta">{report.note || "Cached synthetic demo. Not a real paper."}</p>
+                </>
+              )}
+              {Array.isArray(report.dimensions) && (
+                <>
+                  <h3>Per-dimension diagnostic</h3>
+                  {report.dimensions.map((d) => (
+                    <div key={d.dimension}>
+                      <h4>{d.dimension} ({d.count})</h4>
+                      {d.items && d.items.length > 0 ? (
+                        <ul>
+                          {d.items.map((it, i) => (
+                            <li key={i}>
+                              {it.finding}
+                              {it.evidence ? <span className="marva-meta"> — {it.evidence}</span> : null}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="marva-meta">{d.note || "No finding in this job mapped to this dimension. This dimension is not scored and no finding was invented for it."}</p>
+                      )}
+                    </div>
+                  ))}
+                </>
+              )}
+              {report.citation_flags && (
+                <>
+                  <h3>Citation flags</h3>
+                  <p className="marva-meta">
+                    Missing: {report.citation_flags.missing?.length ? report.citation_flags.missing.join(", ") : "none"} •
+                    Uncited: {report.citation_flags.uncited?.length ? report.citation_flags.uncited.join(", ") : "none"} •
+                    Duplicates: {report.citation_flags.duplicates?.length ? report.citation_flags.duplicates.join(", ") : "none"}
+                  </p>
+                </>
+              )}
+              {Array.isArray(report.fixes) && report.fixes.length > 0 && (
+                <>
+                  <h3>Prioritised fixes</h3>
+                  <ul>
+                    {report.fixes.map((f, i) => (
+                      <li key={i}>
+                        <strong>[{f.priority || "fix"}]</strong> {f.action || f.finding}
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+              <h3>Strengthening references</h3>
+              {Array.isArray(report.strengthening_references) && report.strengthening_references.length > 0 ? (
+                <ul>
+                  {report.strengthening_references.map((r, i) => (
+                    <li key={i}>
+                      {r.title || r.reference} ({r.year || "year unknown"}) — {r.verification || "candidate"}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="marva-meta">
+                  No strengthening reference was verified enough to show in this job.
+                  Candidates that could not be verified were dropped, never shown as certain.
+                </p>
+              )}
+              <h3>Journal recommendations</h3>
+              {Array.isArray(report.journal_recommendations) && report.journal_recommendations.length > 0 ? (
+                <ul>
+                  {report.journal_recommendations.map((r, i) => (
+                    <li key={i}>
+                      {r.journal} — scope evidence only, Scopus status: {r.scopus_indexed_status || "unverified"}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="marva-meta">
+                  No journal recommendation was verified enough to show in this job.
+                  Scopus status is always unverified unless a Scopus check really returns a match;
+                  no journal here is claimed to be Scopus-indexed.
+                </p>
+              )}
+              {Array.isArray(report.limitations) && (
+                <ul className="marva-meta">
+                  {report.limitations.map((l, i) => <li key={i}>{l}</li>)}
+                </ul>
+              )}
+              <details>
+                <summary>Raw report JSON</summary>
+                <pre className="marva-report">{JSON.stringify(report, null, 2)}</pre>
+              </details>
+            </>
           ) : (
             <p className="marva-meta">
               No report yet. Run the synthetic demo or start an audit; the

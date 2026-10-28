@@ -32,6 +32,7 @@ import { extractReferenceKey, normalizeKey } from "./citation-matcher.mjs";
 import { runAgent, escalateAmbiguous } from "./agents.mjs";
 import { extractTextFromPdf } from "./pdf.mjs";
 import { verifyReference, searchStrengthening } from "./strengthening.mjs";
+import { buildJournalRecommendations } from "./journal-evidence.mjs";
 import { buildReport, buildReportHTML, buildReportPDF } from "./export.mjs";
 import { loadJob, saveJob, loadActive, saveActive, clearActiveIf, deleteJob } from "./store.mjs";
 import { SYNTHETIC_DEMO } from "./demo.mjs";
@@ -255,7 +256,16 @@ export async function runStage(env, job, stage, text, deps = {}) {
         const j = await runAgent("journal", { reader: job.reader || null, references: job.references }, agentDeps);
         if (j.data) {
           job.journal = { ...j.data, scopus_indexed_status: "unverified" };
-          await pushEvent(env, job, { stage: "journal", status: "done", detail: `Fields: ${(j.data.fields || []).map((f) => f.name).join(", ") || "none"}` });
+          // Journal recommendations from real OpenAlex evidence only.
+          // A failed/empty search leaves an empty list, honestly reported
+          // by the export layer, never filled with an invented journal.
+          try {
+            const ev = await buildJournalRecommendations(j.data.fields || [], fetchImpl);
+            job.journal_recommendations = ev.recommendations;
+          } catch {
+            job.journal_recommendations = [];
+          }
+          await pushEvent(env, job, { stage: "journal", status: "done", detail: `Fields: ${(j.data.fields || []).map((f) => f.name).join(", ") || "none"}; journal recommendations: ${(job.journal_recommendations || []).length} (OpenAlex evidence only)` });
         } else {
           job.journal = null;
           await pushEvent(env, job, { stage: "journal", status: "failed", detail: j.error || "Journal failed" });
