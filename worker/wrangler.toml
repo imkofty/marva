@@ -1,0 +1,15 @@
+# MARVA Worker config. No secrets in this file.
+# The KV namespace id below was supplied at build time (a resource id, not a secret).
+# MODEL_API_KEY must NOT be a plain var here: a secret with the same name
+# conflicts with wrangler secret put (error 10053). Set it only via
+# `wrangler secret put MODEL_API_KEY` at deploy time. Without a real key,
+# the Reader/Gap/Journal/Supervisor model stages report "skipped" honestly
+# and the deterministic stages still run.
+name = "marva-backend-worker"
+main = "src/index.mjs"
+compatibility_date = "2026-10-27"
+compatibility_flags = ["nodejs_compat"]
+
+[[kv_namespaces]]
+binding = "MARVA_JOBS"
+id = "f84f03264db8463eb60f09b7b94c7b9a"

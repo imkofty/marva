@@ -1,0 +1,1 @@
+{"description":"MARVA backend as a Cloudflare Worker. Same job flow as the Node server, adapted to fetch handler + KV + waitUntil. No secrets in this repo.","name":"marva-backend-worker","private":true,"scripts":{"deploy":"wrangler deploy","dev":"wrangler dev","test":"node --test tests/worker.test.mjs"},"type":"module","version":"0.1.0"}
