@@ -72,19 +72,50 @@ function parseNumericZone(zone) {
 }
 
 function parseAuthorYearZone(zone) {
+  // Two author-year list styles, both line-based:
+  //  - "Davis, 1989. Perceived usefulness..." (surname, year up front)
+  //  - APA: "Serra, C. E. M., & Kunc, M. (2015). Benefits..." and
+  //    "Shaw, J., Gray, C. S., ... & Wodchis, W. (2018). ..." where
+  //    the year sits in parentheses lines AFTER the start line (long
+  //    author lists wrap). The year is therefore read from the whole
+  //    entry, not from the start line alone; entries without any
+  //    year are dropped (footers, headers, fragments).
   const lines = String(zone).split(/\n/);
-  const entries = [];
+  const entries = []; // {text, key}
   let current = null;
-  const flush = () => { if (current) entries.push(current); current = null; };
+  let currentSurname = null;
+  const flush = () => {
+    if (current) {
+      const parenYear = current.match(/\(((?:19|20)\d{2})\)/);
+      const plainYear = current.match(/^[^,;]+,\s*((?:19|20)\d{2})\b/);
+      const year = parenYear ? parenYear[1] : (plainYear ? plainYear[1] : null);
+      if (year && currentSurname) entries.push({ text: current, key: `${currentSurname.trim().toLowerCase()}, ${year}` });
+    }
+    current = null;
+    currentSurname = null;
+  };
   for (const rawLine of lines) {
     const line = rawLine.trim();
     if (!line) continue;
     if (/^(appendix|acknowledg|funding|author contributions|conflict)/i.test(line)) { flush(); break; }
     let stripped = line.replace(/^[-•*]\s+/, "").replace(/^\d{1,3}\.\s+/, "");
-    const m = stripped.match(/^([^,;]{1,80}?),\s*((?:19|20)\d{2})\b/);
-    if (m) {
+    const plain = stripped.match(/^([^,;]{1,80}?),\s*((?:19|20)\d{2})\b/);
+    const apa = stripped.match(/^([^,;]{1,80}?),\s*(?:[A-Z]\.\s*)+/);
+    // Organisation author: "World Bank. (2006). Title..." / "OECD. (2015). ..."
+    // — no comma after the name, so neither pattern above fires.
+    const org = stripped.match(/^([A-Z][A-Za-zÀ-ÿ'’\-]+(?:\s+[A-Z][A-Za-zÀ-ÿ'’\-]+)*)\.\s*\(((?:19|20)\d{2})\)/);
+    const orgSurname = org ? org[1] : null;
+    // A surname+initial line is a NEW entry only when the current
+    // entry already has its year. Otherwise it is still the author
+    // list of the current entry wrapping onto a new line — the real
+    // APA trap: "… Sheridan, N., &" then "Wodchis, W. (2018)." must
+    // NOT split the Shaw entry into a yearless Shaw (dropped) plus
+    // a spurious Wodchis entry.
+    const currentHasYear = current && (/\(((?:19|20)\d{2})\)/.test(current) || /^[^,;]+,\s*(?:19|20)\d{2}\b/.test(current));
+    if ((plain || apa || org) && (!current || currentHasYear)) {
       flush();
       current = stripped;
+      currentSurname = plain ? plain[1] : (apa ? apa[1] : orgSurname);
     } else if (current) {
       // Continuation line of the previous entry (wrapped PDF line).
       if (!/^\d{1,3}\.\s*[A-Z]/.test(line)) current += " " + line;
@@ -92,11 +123,7 @@ function parseAuthorYearZone(zone) {
   }
   flush();
   if (entries.length < 2) return null;
-  const keys = entries.map((e) => {
-    const mm = e.match(/^([^,;]+),\s*((?:19|20)\d{2})\b/);
-    return mm ? `${mm[1].trim().toLowerCase()}, ${mm[2]}` : e.toLowerCase();
-  });
-  return { style: "author-year", entries, keys, count: entries.length };
+  return { style: "author-year", entries: entries.map((e) => e.text), keys: entries.map((e) => e.key), count: entries.length };
 }
 
 export function splitReferenceZone(text) {
@@ -129,11 +156,24 @@ export function scanAuthorYearCitations(bodyText) {
     const key = `${surname.trim().toLowerCase()}, ${year}`;
     if (!seen.has(key)) { seen.add(key); out.push(key); }
   };
-  const re1 = /\b([A-Z][A-Za-zÀ-ÿ'’\-]+)(?:\s+et al\.?)?,\s*((?:19|20)\d{2})\b/g;
+  // Second-author guard: a surname that directly follows "&" or
+  // "and" (allowing a line break between, as PDF extraction wraps:
+  // "Serra & \nKunc, 2015") is NOT its own citation; re3/re4 capture
+  // the first author instead. A fixed lookbehind alone fails across
+  // the line break, so check the last word before the match.
+  const isSecondAuthor = (idx) => /(?:^|[\s])(&|and)$/.test(String(bodyText).slice(0, idx).trimEnd());
+  const re1 = /\b(?<!& )(?<!and )([A-Z][A-Za-zÀ-ÿ'’\-]+)(?:\s+et al\.?)?,\s*((?:19|20)\d{2})\b/g;
   let m;
-  while ((m = re1.exec(bodyText)) !== null) push(m[1], m[2]);
-  const re2 = /\b([A-Z][A-Za-zÀ-ÿ'’\-]+)(?:\s+et al\.?)?\s*\(((?:19|20)\d{2})\)/g;
-  while ((m = re2.exec(bodyText)) !== null) push(m[1], m[2]);
+  while ((m = re1.exec(bodyText)) !== null) { if (!isSecondAuthor(m.index)) push(m[1], m[2]); }
+  const re2 = /\b(?<!& )(?<!and )([A-Z][A-Za-zÀ-ÿ'’\-]+)(?:\s+et al\.?)?\s*\(((?:19|20)\d{2})\)/g;
+  while ((m = re2.exec(bodyText)) !== null) { if (!isSecondAuthor(m.index)) push(m[1], m[2]); }
+  // APA two-author citations: only the FIRST author keys the entry,
+  // so "(Serra & Kunc, 2015)" and "Serra and Kunc (2015)" must yield
+  // "serra, 2015", not "kunc, 2015" (which would false-flag both ways).
+  const re3 = /\b([A-Z][A-Za-zÀ-ÿ'’\-]+)\s+(?:&|and)\s+[A-Z][A-Za-zÀ-ÿ'’\-]+,\s*((?:19|20)\d{2})\b/g;
+  while ((m = re3.exec(bodyText)) !== null) push(m[1], m[2]);
+  const re4 = /\b([A-Z][A-Za-zÀ-ÿ'’\-]+)\s+(?:&|and)\s+[A-Z][A-Za-zÀ-ÿ'’\-]+\s*\(((?:19|20)\d{2})\)/g;
+  while ((m = re4.exec(bodyText)) !== null) push(m[1], m[2]);
   return out;
 }
 

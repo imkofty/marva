@@ -22,6 +22,44 @@ export function extractReferenceKey(ref) {
   return normalizeKey(cleaned);
 }
 
+// Author-year matching with one deterministic variant rule, on top of
+// exact matching: a cited surname that equals the LAST word of a
+// listed surname (same year) counts as that entry. This covers the
+// paper's own variants — text cites "Souza" for listed "De Souza",
+// "Costa" for listed "Da Silva Costa", "Bank" for listed
+// "World Bank" — without fuzzy similarity: the year must match, and
+// if two listed entries share the same last word + year, the cited
+// key stays unmatched (ambiguous, flagged for the author, never
+// silently assigned to one of them).
+export function matchAuthorYearKeys(inText, referenceList) {
+  const cited = inText.map(normalizeKey);
+  const listed = referenceList.map(normalizeKey);
+  const listedSet = new Set(listed);
+  const citedSet = new Set(cited);
+  const lastWord = (key) => {
+    const surname = key.split(",")[0].trim();
+    const words = surname.split(/\s+/);
+    return words[words.length - 1];
+  };
+  const yearOf = (key) => (key.split(",")[1] || "").trim();
+  const matchedListed = new Set();
+  const missing = [];
+  for (const c of new Set(cited)) {
+    if (listedSet.has(c)) { matchedListed.add(c); continue; }
+    const cands = listed.filter((l) => !matchedListed.has(l) && yearOf(l) === yearOf(c) && lastWord(l) === lastWord(c));
+    if (cands.length === 1) matchedListed.add(cands[0]);
+    else missing.push(c);
+  }
+  const uncited = listed.filter((l) => !matchedListed.has(l));
+  const seen = new Set();
+  const duplicates = [];
+  for (const l of listed) {
+    if (seen.has(l) && !duplicates.includes(l)) duplicates.push(l);
+    seen.add(l);
+  }
+  return { missing: [...new Set(missing)], uncited: [...new Set(uncited)], duplicates };
+}
+
 export function matchCitations(inText, referenceList) {
   const cited = inText.map(normalizeKey);
   const listed = referenceList.map(normalizeKey);

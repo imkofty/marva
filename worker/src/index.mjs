@@ -28,7 +28,7 @@
 // KV race note: KV put is not an atomic compare-and-swap, so two
 // POSTs arriving in the same instant could both pass the lock check;
 // this is a demo limitation, not a guarantee for production.
-import { extractReferenceKey, normalizeKey } from "./citation-matcher.mjs";
+import { extractReferenceKey, normalizeKey, matchAuthorYearKeys } from "./citation-matcher.mjs";
 import { parseReferences, scanAuthorYearCitations, scanBracketCitations, scanSuperscriptCitations, splitMarkedBody, stripMarkerChars } from "./reference-parser.mjs";
 import { runAgent, escalateAmbiguous } from "./agents.mjs";
 import { extractTextFromPdf } from "./pdf.mjs";
@@ -292,9 +292,27 @@ export async function runStage(env, job, stage, text, deps = {}) {
       }
     } else if (job.reference_keys && job.reference_style === "author-year") {
       listedKeys = job.reference_keys;
-      const ayFromJob = (job.citations || []).map(normalizeKey).filter((k) => /,\s*(19|20)\d{2}$/.test(k));
-      citedKeys = [...new Set([...(scanned.author_year || []), ...ayFromJob])];
+      // Cited keys come ONLY from code scanning the body. The Reader
+      // model's citation strings are deliberately excluded here:
+      // live they arrive in raw forms ("Bhattacharya et al., 2012",
+      // "Serra & Kunc, 2015", whole multi-citation strings joined by
+      // ";") that do not match listed keys and flooded the live
+      // RISET job with 60+ false missing findings, while the body
+      // scan alone gave the correct 5. A model citation is not
+      // evidence of a body citation; the scan is.
+      citedKeys = [...new Set(scanned.author_year || [])];
       mode = "author-year";
+      // Parser author-year lists use last-word surname matching
+      // (text "Souza" for listed "De Souza", "Bank" for "World Bank").
+      // matchAuthorYearKeys returns missing/uncited directly, so
+      // handle this mode before the generic _origMatch below.
+      const ayMatched = matchAuthorYearKeys(citedKeys, listedKeys);
+      job.result = { ...ayMatched, status: "done", mode };
+      job.result.uncited_references = refs.filter((r, idx) => ayMatched.uncited.includes(listedKeys[idx]));
+      job.citation_status = "done";
+      job.citation_note = null;
+      await pushEvent(env, job, { stage: "citation_matcher", status: "done", detail: `Missing: ${ayMatched.missing.length}, uncited: ${ayMatched.uncited.length}, duplicates: ${ayMatched.duplicates.length} (mode: ${mode})`, result: job.result });
+      return;
     } else {
       listedKeys = refs.map(extractReferenceKey);
       citedKeys = (job.citations || []).map(normalizeKey);

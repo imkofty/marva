@@ -273,3 +273,81 @@ test("Gate: job with no references reports skipped, not missing flood", async ()
     assert.ok(refDim.note && refDim.note.includes("skipped"));
   } finally { globalThis.fetch = orig; }
 });
+
+test("Parser: APA author-year list, year on a later line, & citations keyed by first author", async () => {
+  const { parseReferences, scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchCitations } = await import("../src/citation-matcher.mjs");
+  const text = "Work builds on (Serra & Kunc, 2015) and on Shaw et al. (2018), plus an uncited older work and a missing study (Rahman, 2021).\n\nReferences\nSerra, C. E. M., & Kunc, M. (2015). Benefits realisation management and its influence on project success. International Journal of Project Management, 33(1), 53-66.\nShaw, J., Gray, C. S., Baker, G. R., Denis, J. L., Breton, M., Gutberg, J., Embuldeniya, G., Carswell, P., Dunham, A., McKillop, A., Kenealy, T., Sheridan, N., & Wodchis, W. (2018). Mechanisms, contexts and points of contention. BMC Medical Research Methodology, 18, Article 178.\nTodes, A. (2012). New directions in spatial planning. Journal of Planning Education and Research, 32(4), 400-414.";
+  const p = parseReferences(text);
+  assert.equal(p.style, "author-year");
+  assert.deepEqual(p.keys, ["serra, 2015", "shaw, 2018", "todes, 2012"]);
+  const cited = scanAuthorYearCitations(p.body);
+  assert.ok(cited.includes("serra, 2015"), "Serra & Kunc must key by first author");
+  assert.ok(cited.includes("shaw, 2018"));
+  assert.ok(!cited.includes("kunc, 2015"));
+  const res = matchCitations(cited, p.keys);
+  assert.deepEqual(res.missing, ["rahman, 2021"]);
+  assert.deepEqual(res.uncited, ["todes, 2012"]);
+});
+
+test("Parser: APA wrapped author list does not split, wrapped & does not create second-author citation", async () => {
+  const { parseReferences, scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchCitations } = await import("../src/citation-matcher.mjs");
+  const text = "Work cites (Shaw et al., 2018) and (Serra & \nKunc, 2015).\n\nReferences\nShaw, J., Gray, C. S., Baker, G. R., Denis, J. L., Breton, M., Gutberg, J., Embuldeniya, G., Carswell, P., Dunham, A., McKillop, A., Kenealy, T., Sheridan, N., & \nWodchis, W. (2018). Mechanisms, contexts and points of contention. BMC Medical Research Methodology, 18, Article 178.\nSerra, C. E. M., & Kunc, M. (2015). Benefits realisation management. International Journal of Project Management, 33(1), 53-66.";
+  const p = parseReferences(text);
+  assert.deepEqual(p.keys, ["shaw, 2018", "serra, 2015"]);
+  const cited = scanAuthorYearCitations(p.body);
+  assert.ok(cited.includes("shaw, 2018"));
+  assert.ok(cited.includes("serra, 2015"));
+  assert.ok(!cited.includes("wodchis, 2018"));
+  assert.ok(!cited.includes("kunc, 2015"));
+  const res = matchCitations(cited, p.keys);
+  assert.deepEqual(res.missing, []);
+  assert.deepEqual(res.uncited, []);
+});
+
+test("Matcher: last-word surname variant + organisation entries", async () => {
+  const { parseReferences, scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchAuthorYearKeys } = await import("../src/citation-matcher.mjs");
+  const text = "Work cites (Souza, 2016), (Bank, 2019) and (Costa, 1998).\n\nReferences\nDe Souza, M. (2016). Governance in practice.\nWorld Bank. (2019). Development report.\nDa Silva Costa, A. (1998). Regional planning.";
+  const p = parseReferences(text);
+  assert.deepEqual(p.keys, ["de souza, 2016", "world bank, 2019", "da silva costa, 1998"]);
+  const res = matchAuthorYearKeys(scanAuthorYearCitations(p.body), p.keys);
+  assert.deepEqual(res.missing, []);
+  assert.deepEqual(res.uncited, []);
+  // Ambiguous last word: two listed entries share last word + year.
+  const amb = matchAuthorYearKeys(["souza, 2016"], ["de souza, 2016", "da souza, 2016"]);
+  assert.deepEqual(amb.missing, ["souza, 2016"]);
+});
+
+test("Matcher ignores messy Reader-model citations, uses body scan only", async () => {
+  const orig = installFakeFetch();
+  const fake = globalThis.fetch;
+  // Wrap the fake: Reader returns raw messy citation strings, as live.
+  globalThis.fetch = async (url, opts = {}) => {
+    const res = await fake(url, opts);
+    const u = String(url);
+    if (u.includes("api.meta.ai")) {
+      const body = JSON.parse(opts.body || "{}");
+      if ((body.messages?.[0]?.content || "").includes("extract structure")) {
+        const data = await res.json();
+        const payload = JSON.parse(data.choices[0].message.content);
+        payload.citations = ["Bhattacharya et al., 2012", "Serra & Kunc, 2015", "Coleman & Kirkham, 2026; Malekpour & Newig, 2020", "Davis, 1989", "Rahman, 2021", "Patel, 2019", "Kumar, 2005", "Venkatesh, 2003"];
+        return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(payload) } }] }) };
+      }
+    }
+    return res;
+  };
+  try {
+    const env = makeEnv("x");
+    const ctx = makeCtx();
+    const res = await postJob(env, ctx, { text: "Synthetic manuscript text. The checklist is based on the Technology Acceptance Model (Davis, 1989). It builds on earlier farm work (Kumar, 2005), recent checklist work (Patel, 2019) and a missing study (Rahman, 2021), and follows acceptance research (Venkatesh, 2003).\n\n## References\n- Davis, 1989. Perceived usefulness. MIS Quarterly.\n- Venkatesh, 2003. User acceptance. MIS Quarterly.\n- Patel, 2018. Mobile checklists for farm work.\n- Kumar, 2005. Early farm advisory services.\n- Wijaya, 2017. Irrigation scheduling in dry regions." });
+    const created = await res.json();
+    await pollUntilDone(env, created.jobId);
+    const { body } = await getJob(env, created.jobId);
+    assert.deepEqual(body.result.missing.sort(), ["patel, 2019", "rahman, 2021"]);
+    assert.deepEqual(body.result.uncited.sort(), ["patel, 2018", "wijaya, 2017"]);
+    assert.ok(!body.result.missing.join(" ").includes("bhattacharya"));
+    assert.ok(!body.result.missing.join(" ").includes("serra"));
+  } finally { globalThis.fetch = orig; }
+});
