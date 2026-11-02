@@ -34,6 +34,10 @@ export const AGENTS = {
     system: "You simulate a sharp journal reviewer from extracted claims only. Return JSON only: {questions:[{question,location}]}. Every question must cite a real location in the manuscript. Never invent a claim, a location, or a verdict. This is a SIMULATION, not a real reviewer and not a prediction of acceptance.",
     model: "muse-wonder-1.0",
   },
+  crosscheck: {
+    system: "You resolve ambiguous in-text citations from textual evidence only. Input cases each carry one cited key, its citing sentence, and candidate reference entries that share its last-word surname and year. Return JSON only: {decisions:[{cited, pick, reason}]} where pick is exactly one candidate key or null, and reason is one sentence citing the textual evidence. Pick a candidate ONLY if the citing sentence contains evidence tying it to that entry (distinctive content words shared with its title, or a named author detail). If the sentence does not distinguish the candidates, pick null, never guess. A pick is not a verification: verification comes only from a database DOI match.",
+    model: "muse-wonder-1.0",
+  },
   narrator: {
     system: "You rewrite a structured audit fact into one short casual office sentence in English, keeping every number and meaning unchanged. Return JSON only: {bubble}. Never add a new finding, number or claim.",
     model: "muse-spark-1.3",

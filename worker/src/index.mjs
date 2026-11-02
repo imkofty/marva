@@ -17,6 +17,12 @@
 // runJob: live-office bubbles are the real stage-event details, the
 // same as the Node server; a Narrator call would add a model round
 // trip per stage for no new finding.
+// Execution engine (since 2026-10-29): a Durable Object per job
+// (job-object.mjs). POST runs Reader synchronously, hands the record
+// to the DO, and the DO drives the rest with alarms — one stage (or
+// one verifier batch) per alarm, one storage write per step. GET
+// /events is read-only; the frontend poll no longer advances anything.
+// KV keeps the DOI cache and the `active` gate only.
 // Honest rules, same as Node: if MODEL_API_KEY is unset, model stages
 // report "skipped", never faked; no plagiarism percentage anywhere;
 // a failed stage is recorded with status "failed" and the job
@@ -25,18 +31,26 @@
 // missing key. One job at a time for the demo: a second POST while a
 // job is running returns 409. A stale active lock (job record done,
 // missing, or not updated for 10 minutes) is cleared on the next POST.
-// KV race note: KV put is not an atomic compare-and-swap, so two
-// POSTs arriving in the same instant could both pass the lock check;
-// this is a demo limitation, not a guarantee for production.
+// Race note: the per-job stage race is gone — a DO serialises its
+// own requests, so no lock is needed inside a job. The POST gate
+// still reads the KV `active` key, so two POSTs arriving in the same
+// instant could both pass the gate check; that residual demo
+// limitation (not the stage race) remains.
 import { extractReferenceKey, normalizeKey, matchAuthorYearKeys } from "./citation-matcher.mjs";
-import { parseReferences, scanAuthorYearCitations, scanBracketCitations, scanSuperscriptCitations, splitMarkedBody, stripMarkerChars } from "./reference-parser.mjs";
+import { parseReferences, scanAuthorYearCitations, scanAuthorYearCitationContexts, scanBracketCitations, scanSuperscriptCitations, splitMarkedBody, stripMarkerChars } from "./reference-parser.mjs";
 import { runAgent, escalateAmbiguous } from "./agents.mjs";
+import { runCrosscheck } from "./crosscheck.mjs";
 import { extractTextFromPdf } from "./pdf.mjs";
-import { verifyReference, searchStrengthening } from "./strengthening.mjs";
+import { verifyReference, searchStrengthening, extractDOI } from "./strengthening.mjs";
 import { buildJournalRecommendations } from "./journal-evidence.mjs";
 import { buildReport, buildReportHTML, buildReportPDF } from "./export.mjs";
 import { loadJob, saveJob, loadActive, saveActive, clearActiveIf, deleteJob } from "./store.mjs";
 import { SYNTHETIC_DEMO } from "./demo.mjs";
+
+// Durable Object class (defined in job-object.mjs; re-exported here
+// because Cloudflare requires DO classes to be exported from the
+// Worker's main module). See the circular-import note in that file.
+export { JobObject } from "./job-object.mjs";
 
 const STALE_MS = 10 * 60 * 1000;
 const CORS = {
@@ -55,10 +69,44 @@ function publicJob(job) {
   return { ...rest, report: buildReport(job) };
 }
 
-async function pushEvent(env, job, event) {
+// --- Durable Object routing ------------------------------------------------
+// The DO is the live home of every job record. The Worker only routes:
+// POST /jobs initialises the DO after the synchronous Reader stage,
+// and every later job route reads or mutates through the DO. KV keeps
+// the DOI cache, the `active` gate, and pre-migration job copies.
+// In tests env.JOB_OBJECTS is a fake binding (see worker.test.mjs);
+// in production the binding always exists after the DO deploy.
+function doStub(env, id) {
+  if (!env.JOB_OBJECTS) throw new Error("JOB_OBJECTS binding not configured");
+  return env.JOB_OBJECTS.get(env.JOB_OBJECTS.idFromName(id));
+}
+
+async function doCall(env, id, path, opts = {}) {
+  const stub = doStub(env, id);
+  const res = await stub.fetch(new Request(`http://do${path}${path.includes("?") ? "&" : "?"}id=${encodeURIComponent(id)}`, opts));
+  const body = await res.json().catch(() => ({}));
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(body.error || `DO ${path} failed (${res.status})`);
+  return body;
+}
+
+async function doState(env, id) {
+  return doCall(env, id, "/state");
+}
+
+// Events are buffered in memory only. The caller persists them with
+// saveJob: the DO alarm saves once at the end of every alarm step
+// (lock save at start + final save), and the POST /jobs handler saves
+// after the synchronous Reader stage. Saving on every event used to
+// cost a full KV put per event on top of those saves — under the
+// free-tier 1,000-writes/day budget that burned the quota mid-job
+// (2026-10-29: job 429 stalled at 134/161 on "KV put() limit
+// exceeded"). Buffering is what takes an advancing poll from 3–4
+// puts down to exactly 2. `env` is kept in the signature so all
+// existing call sites stay unchanged.
+export async function pushEvent(env, job, event) {
   job.events.push(event);
   if (event.status === "failed" || event.status === "skipped") job.partial = true;
-  await saveJob(env, job);
 }
 
 // Chunk body text at paragraph boundaries so a long paper's claims are
@@ -209,6 +257,11 @@ export async function runStage(env, job, stage, text, deps = {}) {
         superscript: scanSuperscriptCitations(splitMarkedBody(text)),
       };
       job.scanned_citations = scanned;
+      // Citing sentences for the Wonder cross-check (same class of
+      // derived excerpt as the Reader's own quotes: one sentence per
+      // cited key, used only to resolve ambiguous matches, never
+      // returned as manuscript text and deleted with the job).
+      job.citation_contexts = scanAuthorYearCitationContexts(plainBody);
       const providedCitations = job.citations || [];
       const providedReferences = job.references || [];
       if (parsed.status === "parsed") {
@@ -307,11 +360,31 @@ export async function runStage(env, job, stage, text, deps = {}) {
       // matchAuthorYearKeys returns missing/uncited directly, so
       // handle this mode before the generic _origMatch below.
       const ayMatched = matchAuthorYearKeys(citedKeys, listedKeys);
-      job.result = { ...ayMatched, status: "done", mode };
-      job.result.uncited_references = refs.filter((r, idx) => ayMatched.uncited.includes(listedKeys[idx]));
+      // Wonder cross-check (sub-step of this stage, not a new stage:
+      // the 7-stage room mapping stays intact). Only code-flagged
+      // ambiguous cases reach Wonder; every proposal is validated by
+      // code, and only accepted ones move a key out of missing/uncited
+      // into "matched-by-crosscheck" — never into "verified".
+      let missing = ayMatched.missing;
+      let uncited = ayMatched.uncited;
+      let crosscheck = { proposed: 0, accepted: [], rejected: [], abstained: [], skipped: null };
+      if (ayMatched.ambiguous && ayMatched.ambiguous.length > 0) {
+        if (hasKey) {
+          const cc = await runCrosscheck(ayMatched.ambiguous, { listedKeys, refs, contexts: job.citation_contexts || [], agentDeps });
+          crosscheck = cc;
+          const accCited = new Set(cc.accepted.map((a) => a.cited));
+          const accMatched = new Set(cc.accepted.map((a) => a.matched));
+          missing = missing.filter((m) => !accCited.has(m));
+          uncited = uncited.filter((u) => !accMatched.has(u));
+        } else {
+          crosscheck.skipped = "MODEL_API_KEY not set; ambiguous cases stay flagged.";
+        }
+      }
+      job.result = { missing, uncited, duplicates: ayMatched.duplicates, ambiguous: ayMatched.ambiguous, crosscheck, status: "done", mode };
+      job.result.uncited_references = refs.filter((r, idx) => uncited.includes(listedKeys[idx]));
       job.citation_status = "done";
       job.citation_note = null;
-      await pushEvent(env, job, { stage: "citation_matcher", status: "done", detail: `Missing: ${ayMatched.missing.length}, uncited: ${ayMatched.uncited.length}, duplicates: ${ayMatched.duplicates.length} (mode: ${mode})`, result: job.result });
+      await pushEvent(env, job, { stage: "citation_matcher", status: "done", detail: `Missing: ${missing.length}, uncited: ${uncited.length}, duplicates: ${ayMatched.duplicates.length} (mode: ${mode}; crosscheck: ${crosscheck.proposed} proposed, ${crosscheck.accepted.length} accepted by code validation, ${crosscheck.rejected.length} rejected, ${crosscheck.abstained.length} abstained${crosscheck.skipped ? "; crosscheck skipped: no model key" : ""})`, result: job.result });
       return;
     } else {
       listedKeys = refs.map(extractReferenceKey);
@@ -322,6 +395,18 @@ export async function runStage(env, job, stage, text, deps = {}) {
     job.result = { ...matched, status: "done", mode };
     if (mode.startsWith("numeric")) {
       job.result.uncited_references = refs.filter((r, idx) => matched.uncited.includes(listedKeys[idx]));
+      // Truncated-list honesty (20-paper test: 435 parsed 13 of ~137,
+      // 509 parsed 28 of ~76): when the body cites far beyond the end
+      // of the parsed list, the tail was not parsed — merged entries
+      // or an unrecognised format — so "missing" tail numbers are
+      // unconfirmed, not proven absent. A gap under 5 is ordinary
+      // missing references, not truncation.
+      const nums = citedKeys.map(Number).filter(Number.isFinite);
+      const maxCited = nums.length ? Math.max(...nums) : 0;
+      if (maxCited - listedKeys.length >= 5) {
+        job.result.list_truncated = true;
+        job.result.list_note = `The parsed reference list ends at ${listedKeys.length}, but the body cites up to [${maxCited}]: the tail of the list was not parsed (merged entries or an unrecognised list format), so the ${matched.missing.length} "missing" numbers above are unconfirmed, not proven absent.`;
+      }
     } else {
       job.result.uncited_references = refs.filter((r) => matched.uncited.includes(extractReferenceKey(r)));
     }
@@ -331,27 +416,124 @@ export async function runStage(env, job, stage, text, deps = {}) {
     return;
   }
   if (stage === "reference_verifier") {
+    // Resumable across polls (Wonder P5): a 200-reference paper cannot
+    // be verified in one poll without either timing out or hammering
+    // a rate-limited database. Each poll verifies the next batch of 8
+    // references and reports "N/M checked"; the DO alarm re-runs this
+    // stage (without advancing) while job.verifier_incomplete is set.
+    // Order is DOI-bearing references first: Crossref DOI checks are
+    // the ones that can actually reach "verified", and OpenAlex title
+    // checks are what hits the 429 wall, so DOI work should not wait
+    // behind 190 title lookups. DOI results are cached in KV for 30
+    // days (verified only, Wonder #4 — never a rate-limit outcome,
+    // or a transient limit would become permanent). On a 429 the loop
+    // stops at once (no hammering) and later polls wait out an
+    // exponential backoff (60s -> 300s -> 900s, Wonder #3) before
+    // fetching again. Three labels stay strictly
+    // separate: verified (Crossref DOI match) / candidate (OpenAlex
+    // title match, escalated to Wonder) / inconclusive (database
+    // rate limit — not a verdict on the reference).
     try {
-      const verified = [];
-      const flagged = [];
-      const ambiguous = [];
-      for (const ref of job.references) {
-        const v = await verifyReference(ref, fetchImpl);
-        if (v.status === "verified") verified.push(ref);
-        else if (v.status === "candidate") ambiguous.push({ reference: ref, db: v.db });
-        else flagged.push({ reference: ref, reason: v.db?.reason || "unresolved" });
+      if (job.verifier_retry_after && job.verifier_retry_after > Date.now()) return;
+      const refs = job.references || [];
+      let prog = job.verifier_progress;
+      if (!prog) {
+        const order = refs.map((ref, i) => ({ i, doi: !!extractDOI(ref) }));
+        order.sort((a, b) => (b.doi - a.doi) || (a.i - b.i));
+        prog = { order: order.map((o) => o.i), pos: 0, verified: [], flagged: [], ambiguous: [], inconclusive: [] };
       }
-      job.verifier = { verified, flagged, ambiguous: ambiguous.map((a) => a.reference) };
-      if (ambiguous.length > 0 && hasKey) {
-        const esc = await escalateAmbiguous(ambiguous.map((a) => a.reference), agentDeps);
+      // Wonder #2: batch 8 -> 24, guarded by a ~20s wall-clock budget
+      // (not by guesswork about per-ref latency). The budget is the
+      // real guard: a batch must stay far under the 120s advancing
+      // lock, and under persistent 429 the loop already exits on the
+      // first limit hit, so a bigger batch costs nothing there.
+      // At least one ref is always processed per batch (done > 0
+      // check) so a single slow ref can never produce a zero-progress
+      // poll.
+      const cachedThisBatch = new Set();
+      const BATCH_MAX = 24;
+      const BATCH_BUDGET_MS = 20000;
+      const batchStart = Date.now();
+      let done = 0;
+      let hitLimit = false;
+      while (prog.pos < prog.order.length && done < BATCH_MAX) {
+        if (done > 0 && Date.now() - batchStart > BATCH_BUDGET_MS) break;
+        const ref = refs[prog.order[prog.pos]];
+        const doi = extractDOI(ref);
+        let v = null;
+        if (doi && env.MARVA_JOBS) {
+          try {
+            const cached = await env.MARVA_JOBS.get(`verify:doi:${doi}`);
+            if (cached) { const db = JSON.parse(cached); v = { reference: ref, status: db.status, db }; }
+          } catch { v = null; }
+        }
+        if (!v) {
+          v = await verifyReference(ref, fetchImpl);
+          if (v.status === "inconclusive") {
+            prog.inconclusive.push({ reference: ref, reason: v.db?.reason || "rate limited" });
+            prog.pos += 1;
+            // Exponential backoff ladder (Wonder #3): a flat 60s retry
+            // made the job burn ~3 KV puts per minute per rate-limited
+            // reference while producing only inconclusive results.
+            // Ladder 60s -> 300s -> 900s (capped) slows the burn rate
+            // per hour; a clean batch resets it (see below). The
+            // field is optional: jobs stored before this change have
+            // no backoff_level and are treated as level 0, so the
+            // running job 328 resumes at 60s, not at a cold start.
+            const level = job.backoff_level || 0;
+            const delays = [60, 300, 900];
+            job.verifier_retry_after = Date.now() + delays[Math.min(level, delays.length - 1)] * 1000;
+            job.backoff_level = level + 1;
+            hitLimit = true;
+            break;
+          }
+          // Wonder #4: cache ONLY exact-DOI verified results, never
+          // candidate — caching a candidate would lock 30 days of
+          // uncertainty behind a "verified-looking" cache hit. And
+          // dedupe within the batch: a repeated DOI (duplicate
+          // references, e.g. live job 328) must not pay for the same
+          // cache write twice. (The read path above already returns
+          // a cached DOI for later duplicates; this set covers the
+          // case where the put itself is the first write.)
+          if (doi && v.status === "verified" && env.MARVA_JOBS && !cachedThisBatch.has(doi)) {
+            try { await env.MARVA_JOBS.put(`verify:doi:${doi}`, JSON.stringify(v.db), { expirationTtl: 30 * 24 * 3600 }); cachedThisBatch.add(doi); } catch {}
+          }
+        }
+        if (v.status === "verified") prog.verified.push(ref);
+        else if (v.status === "candidate") prog.ambiguous.push({ reference: ref, db: v.db });
+        else prog.flagged.push({ reference: ref, reason: v.db?.reason || "unresolved" });
+        prog.pos += 1;
+        done += 1;
+      }
+      // A batch with no 429 resets the backoff ladder: the next limit
+      // hit starts again at 60s instead of inheriting a 900s wait
+      // from an earlier, unrelated rate-limit episode.
+      if (!hitLimit) job.backoff_level = 0;
+      job.verifier_progress = prog;
+      if (prog.pos < prog.order.length) {
+        job.verifier_incomplete = true;
+        // No saveJob here: pushEvent only buffers, and the DO alarm
+        // persists everything with its single storage write. The
+        // old extra save was the 4th put on the old KV path.
+        await pushEvent(env, job, { stage: "reference_verifier", status: "running", detail: `Checked ${prog.pos}/${prog.order.length} references — verified: ${prog.verified.length}, flagged: ${prog.flagged.length}, ambiguous: ${prog.ambiguous.length}, inconclusive: ${prog.inconclusive.length}${hitLimit ? " (database rate limit reached; backing off before retrying)" : ""}` });
+        return;
+      }
+      job.verifier_incomplete = false;
+      job.verifier_retry_after = 0;
+      job.backoff_level = 0;
+      job.verifier_progress = null;
+      job.verifier = { verified: prog.verified, flagged: prog.flagged, ambiguous: prog.ambiguous.map((a) => a.reference), inconclusive: prog.inconclusive };
+      if (prog.ambiguous.length > 0 && hasKey) {
+        const esc = await escalateAmbiguous(prog.ambiguous.map((a) => a.reference), agentDeps);
         job.verifier.wonder_reviewed = esc.data || null;
         if (esc.error) job.verifier.wonder_error = esc.error;
-      } else if (ambiguous.length > 0) {
+      } else if (prog.ambiguous.length > 0) {
         job.verifier.wonder_reviewed = null;
       }
-      await pushEvent(env, job, { stage: "reference_verifier", status: "done", detail: `Verified: ${verified.length}, flagged: ${flagged.length}, ambiguous: ${ambiguous.length}` });
+      await pushEvent(env, job, { stage: "reference_verifier", status: "done", detail: `Verified: ${prog.verified.length}, flagged: ${prog.flagged.length}, ambiguous: ${prog.ambiguous.length}, inconclusive: ${prog.inconclusive.length}` });
     } catch (e) {
       job.verifier = null;
+      job.verifier_incomplete = false;
       await pushEvent(env, job, { stage: "reference_verifier", status: "failed", detail: String(e.message || e).slice(0, 300) });
     }
     return;
@@ -452,35 +634,8 @@ export async function runStage(env, job, stage, text, deps = {}) {
   }
 }
 
-// Advance a running job by exactly one stage, guarded by a lock so
-// overlapping polls cannot run the same stage twice. Returns the job
-// after advancing (or unchanged if locked / not running).
-export async function advanceJob(env, job, deps = {}) {
-  if (!job || job.status !== "running") return job;
-  if (job.advancing_until && job.advancing_until > Date.now()) return job;
-  const idx = job.next_stage ?? 0;
-  if (idx >= STAGES.length) return job;
-  job.advancing_until = Date.now() + 120000;
-  await saveJob(env, job);
-  try {
-    await runStage(env, job, STAGES[idx], null, deps);
-  } catch (e) {
-    await pushEvent(env, job, { stage: STAGES[idx], status: "failed", detail: String(e.message || e).slice(0, 300) });
-  }
-  job.advancing_until = 0;
-  job.next_stage = idx + 1;
-  if (job.next_stage >= STAGES.length) {
-    job.status = "done";
-    await pushEvent(env, job, { stage: "job", status: "done", detail: job.partial ? "Job complete with skipped or failed stages (see events)" : "All stages complete" });
-    await clearActiveIf(env, job.id);
-  } else {
-    await saveJob(env, job);
-  }
-  return job;
-}
-
 // Full pipeline, kept for tests: runs all stages sequentially in one
-// call (no waitUntil). Production POST uses reader + advanceJob, not
+// call (no waitUntil). Production POST uses reader + DO alarms, not
 // this, because a single HTTP request that runs the whole pipeline
 // would block the frontend's live room for the full duration.
 export async function runJob(env, job, text, deps = {}) {
@@ -491,6 +646,9 @@ export async function runJob(env, job, text, deps = {}) {
   } finally {
     job.status = "done";
     await pushEvent(env, job, { stage: "job", status: "done", detail: job.partial ? "Job complete with skipped or failed stages (see events)" : "All stages complete" });
+    // Same explicit-save reason as the DO completion branch:
+    // pushEvent buffers only, so persist the done status here.
+    await saveJob(env, job);
     await clearActiveIf(env, job.id);
   }
 }
@@ -512,7 +670,11 @@ export default {
         if (!data || typeof data !== "object") return json({ error: "Body must be JSON" }, 400);
         const activeId = await loadActive(env);
         if (activeId) {
-          const activeJob = await loadJob(env, activeId).catch(() => null);
+          // The gate reads DO state, not the KV copy: after the DO
+          // deploy the KV copy freezes at its post-Reader snapshot
+          // and would read "running" forever, breaking the staleness
+          // check. A missing DO record counts as stale.
+          const activeJob = await doState(env, activeId).catch(() => null);
           const stale = !activeJob || activeJob.status !== "running" || (Date.now() - (activeJob.updatedAt || 0) > STALE_MS);
           if (!stale) return json({ error: "One job at a time for the demo", activeJobId: activeId }, 409);
           await saveActive(env, "");
@@ -540,10 +702,11 @@ export default {
         await saveJob(env, job);
         await saveActive(env, job.id);
         // Step-wise: run Reader synchronously here (only stage that
-        // needs the manuscript text, which is never persisted to KV).
-        // Later stages advance one per GET /events poll. Never use
-        // ctx.waitUntil for the pipeline: it is capped at 30 seconds
-        // after the response, which kills a 7-stage job mid-pipeline.
+        // needs the manuscript text, which is never persisted
+        // anywhere). Later stages advance on DO alarms, not on
+        // frontend polls — never use ctx.waitUntil for the pipeline:
+        // it is capped at 30 seconds after the response, which kills
+        // a 7-stage job mid-pipeline.
         try {
           await runStage(env, job, "reader", text, {});
         } catch (e) {
@@ -551,60 +714,66 @@ export default {
         }
         job.next_stage = 1;
         await saveJob(env, job);
+        // Hand the record to its Durable Object, which arms the first
+        // alarm and drives the remaining stages itself. The KV copy
+        // above stays as the migration/backup snapshot. If /init
+        // fails, POST fails honestly (500) — the job is recoverable
+        // via the 409 activeJobId path and the DO lazy-migrates the
+        // KV copy on first access.
+        await doCall(env, job.id, "/init", { method: "POST", body: JSON.stringify({ job }), headers: { "Content-Type": "application/json" } });
         return json({ jobId: job.id, status: job.status }, 201);
       }
       const eventsMatch = url.pathname.match(/^\/jobs\/([^/]+)\/events$/);
       if (request.method === "GET" && eventsMatch) {
-        let job = await loadJob(env, eventsMatch[1]);
+        const job = await doState(env, eventsMatch[1]);
         if (!job) return json({ error: "Job not found" }, 404);
-        // Polling-friendly JSON, not SSE: the frontend polls this every
-        // 2 seconds and renders new events. Each poll advances exactly
-        // one stage (locked against overlapping polls), so the live
-        // room updates stage by stage without a long background task.
+        // Read-only since the DO migration: the frontend polls this
+        // every 2 seconds and renders new events, but progress is
+        // driven by DO alarms, not by polls. /kick is the
+        // self-healing net: if a running job somehow has no alarm
+        // scheduled (failed init, lost alarm), this poll re-arms it.
         if (job.status === "running") {
-          job = await advanceJob(env, job, {});
+          await doCall(env, eventsMatch[1], "/kick", { method: "POST" }).catch(() => null);
         }
         return json({ jobId: job.id, status: job.status, events: job.events || [] });
       }
       const reportJsonMatch = url.pathname.match(/^\/jobs\/([^/]+)\/report\.json$/);
       if (request.method === "GET" && reportJsonMatch) {
-        const job = await loadJob(env, reportJsonMatch[1]);
+        const job = await doState(env, reportJsonMatch[1]);
         if (!job) return json({ error: "Job not found" }, 404);
         return json(buildReport(job));
       }
       const reportHtmlMatch = url.pathname.match(/^\/jobs\/([^/]+)\/report\.html$/);
       if (request.method === "GET" && reportHtmlMatch) {
-        const job = await loadJob(env, reportHtmlMatch[1]);
+        const job = await doState(env, reportHtmlMatch[1]);
         if (!job) return json({ error: "Job not found" }, 404);
         return new Response(buildReportHTML(buildReport(job)), { status: 200, headers: { "Content-Type": "text/html; charset=utf-8", ...CORS } });
       }
       const reportPdfMatch = url.pathname.match(/^\/jobs\/([^/]+)\/report\.pdf$/);
       if (request.method === "GET" && reportPdfMatch) {
-        const job = await loadJob(env, reportPdfMatch[1]);
+        const job = await doState(env, reportPdfMatch[1]);
         if (!job) return json({ error: "Job not found" }, 404);
         return new Response(buildReportPDF(buildReport(job)), { status: 200, headers: { "Content-Type": "application/pdf", ...CORS } });
       }
       const confirmMatch = url.pathname.match(/^\/jobs\/([^/]+)\/confirm$/);
       if (request.method === "POST" && confirmMatch) {
-        const job = await loadJob(env, confirmMatch[1]);
-        if (!job) return json({ error: "Job not found" }, 404);
         let data = {};
         try { data = await request.json(); } catch { return json({ error: "Body must be JSON" }, 400); }
         if (data.confirmed !== true) return json({ error: "confirmed must be true" }, 400);
-        job.confirmed = true;
-        job.events.push({ stage: "gate", status: "confirmed", detail: "Author confirmed references (POST /jobs/:id/confirm). Confirmation records the author's review; it does not verify a reference or a journal by itself.", gate: "author_confirmation" });
-        await saveJob(env, job);
-        return json({ jobId: job.id, confirmed: true });
+        const res = await doCall(env, confirmMatch[1], "/confirm", { method: "POST" });
+        if (!res) return json({ error: "Job not found" }, 404);
+        return json(res);
       }
       const jobMatch = url.pathname.match(/^\/jobs\/([^/]+)$/);
       if (request.method === "GET" && jobMatch) {
-        const job = await loadJob(env, jobMatch[1]);
+        const job = await doState(env, jobMatch[1]);
         if (!job) return json({ error: "Job not found" }, 404);
         return json(publicJob(job));
       }
       if (request.method === "DELETE" && jobMatch) {
-        const job = await loadJob(env, jobMatch[1]);
+        const job = await doState(env, jobMatch[1]);
         if (!job) return json({ error: "Job not found" }, 404);
+        await doCall(env, jobMatch[1], "/delete", { method: "POST" }).catch(() => null);
         await deleteJob(env, jobMatch[1]);
         await clearActiveIf(env, jobMatch[1]);
         return json({ deleted: true, jobId: jobMatch[1] });

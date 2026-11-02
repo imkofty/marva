@@ -31,24 +31,44 @@ export function extractReferenceKey(ref) {
 // if two listed entries share the same last word + year, the cited
 // key stays unmatched (ambiguous, flagged for the author, never
 // silently assigned to one of them).
+// A listed entry's matching surname is its FIRST author only: the parser
+// keeps the full author string as the key ("herawati et al., 2021",
+// "li & cai, 2021"), while body citations are keyed by first author
+// ("herawati, 2021", "li, 2021"). Without this reduction the 20-paper
+// test's Agriculture paper reported 50 missing from only 17 references.
+// The last-word fallback below still covers "De Souza" cited as "Souza"
+// and "World Bank" cited as "Bank". Displayed missing/uncited lists
+// always use the ORIGINAL keys, never the reduced ones.
+const matchSurname = (key) => {
+  let s = key.split(",")[0].trim().toLowerCase();
+  s = s.replace(/\s+et al\.?$/, "");
+  s = s.split(/\s+(?:&|and)\s+/)[0].trim();
+  return s;
+};
+
 export function matchAuthorYearKeys(inText, referenceList) {
   const cited = inText.map(normalizeKey);
   const listed = referenceList.map(normalizeKey);
-  const listedSet = new Set(listed);
-  const citedSet = new Set(cited);
-  const lastWord = (key) => {
-    const surname = key.split(",")[0].trim();
+  const yearOf = (key) => (key.split(",")[1] || "").trim();
+  const matchKey = (key) => `${matchSurname(key)}, ${yearOf(key)}`;
+  const lastWord = (surname) => {
     const words = surname.split(/\s+/);
     return words[words.length - 1];
   };
-  const yearOf = (key) => (key.split(",")[1] || "").trim();
   const matchedListed = new Set();
   const missing = [];
+  const ambiguous = [];
   for (const c of new Set(cited)) {
-    if (listedSet.has(c)) { matchedListed.add(c); continue; }
-    const cands = listed.filter((l) => !matchedListed.has(l) && yearOf(l) === yearOf(c) && lastWord(l) === lastWord(c));
+    const cm = matchKey(c);
+    const exact = listed.filter((l) => !matchedListed.has(l) && matchKey(l) === cm);
+    if (exact.length === 1) { matchedListed.add(exact[0]); continue; }
+    if (exact.length > 1) { missing.push(c); ambiguous.push({ cited: c, candidates: exact }); continue; }
+    const cands = listed.filter((l) => !matchedListed.has(l) && yearOf(l) === yearOf(c) && lastWord(matchSurname(l)) === lastWord(matchSurname(c)) && matchSurname(l) !== matchSurname(c));
     if (cands.length === 1) matchedListed.add(cands[0]);
-    else missing.push(c);
+    else {
+      missing.push(c);
+      if (cands.length > 1) ambiguous.push({ cited: c, candidates: cands });
+    }
   }
   const uncited = listed.filter((l) => !matchedListed.has(l));
   const seen = new Set();
@@ -57,7 +77,7 @@ export function matchAuthorYearKeys(inText, referenceList) {
     if (seen.has(l) && !duplicates.includes(l)) duplicates.push(l);
     seen.add(l);
   }
-  return { missing: [...new Set(missing)], uncited: [...new Set(uncited)], duplicates };
+  return { missing: [...new Set(missing)], uncited: [...new Set(uncited)], duplicates, ambiguous };
 }
 
 export function matchCitations(inText, referenceList) {

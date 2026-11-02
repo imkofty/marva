@@ -28,7 +28,7 @@ export function buildReport(job) {
       : "Final report held until the author confirms references: the author must review and confirm every reference (POST /jobs/:id/confirm) before this report is treated as final. Confirmation records the author's review; it does not verify a reference or a journal by itself.",
     diagnostic: job.supervisor || null,
     dimensions: mapDiagnosticToDimensions(job),
-    citation_flags: { missing: r.missing || [], uncited: r.uncited || [], duplicates: r.duplicates || [], status: r.status || job.citation_status || null, mode: r.mode || null, note: job.citation_note || null, reference_style: job.reference_style || null, reference_count: (job.references || []).length },
+    citation_flags: { missing: r.missing || [], uncited: r.uncited || [], duplicates: r.duplicates || [], status: r.status || job.citation_status || null, mode: r.mode || null, note: job.citation_note || null, reference_style: job.reference_style || null, reference_count: (job.references || []).length, list_truncated: r.list_truncated || false, list_note: r.list_note || null, crosscheck: r.crosscheck || null, ambiguous: r.ambiguous || [] },
     reader_summary: job.reader ? { claims: job.reader.claims?.length ?? 0, theories: job.reader.theories?.length ?? 0, quotes: job.reader.quotes?.length ?? 0 } : null,
     verifier: job.verifier || null,
     gap: job.gap || null,

@@ -47,28 +47,64 @@ function cleanEntry(s) {
   return e;
 }
 
+// A marker that is nothing but a page footer ("16. Page 21 of 21"):
+// it hijacks the chain's first occurrence of that number and displaces
+// the real entry. Such a marker is retried at its next occurrence.
+const isFooterOnlyEntry = (txt) => /^(?:\d+\.|\[\d+\])\s*Page \d+( of \d+)?\s*$/.test(txt);
+
 function parseNumericZone(zone) {
-  const markers = []; // {n, idx}
-  for (let n = 1; n <= 999; n++) {
-    // Letter after the dot may be lowercase ("de Looze", "van der").
-    const re = new RegExp(`(?<!\\d)${n}\\.\\s*[A-Za-z]`, "g");
-    const m = re.exec(zone);
-    if (!m) break;
-    markers.push({ n, idx: m.index });
-  }
-  if (markers.length < 2) return null;
-  const byPos = [...markers].sort((a, b) => a.idx - b.idx);
-  const entries = [];
-  const keys = [];
-  for (const mk of markers) {
-    const next = byPos.find((x) => x.idx > mk.idx);
-    const end = next ? next.idx : zone.length;
-    entries.push({ n: mk.n, text: cleanEntry(zone.slice(mk.idx, end)) });
-    keys.push(String(mk.n));
-  }
-  entries.sort((a, b) => a.n - b.n);
-  keys.sort((a, b) => Number(a) - Number(b));
-  return { style: "numeric", entries: entries.map((e) => e.text), keys, count: entries.length };
+  const build = (markers) => {
+    const byPos = [...markers].sort((a, b) => a.idx - b.idx);
+    const entries = [];
+    const keys = [];
+    for (const mk of markers) {
+      const next = byPos.find((x) => x.idx > mk.idx);
+      const end = next ? next.idx : zone.length;
+      entries.push({ n: mk.n, text: cleanEntry(zone.slice(mk.idx, end)) });
+      keys.push(String(mk.n));
+    }
+    entries.sort((a, b) => a.n - b.n);
+    keys.sort((a, b) => Number(a) - Number(b));
+    return { entries: entries.map((e) => e.text), keys, count: entries.length, rawEntries: entries };
+  };
+  const tryChain = (makeRe) => {
+    const markers = []; // {n, idx}
+    for (let n = 1; n <= 999; n++) {
+      const re = makeRe(n);
+      const m = re.exec(zone);
+      if (!m) break;
+      markers.push({ n, idx: m.index });
+    }
+    if (markers.length < 2) return null;
+    // Footer fixup: a footer-only entry means the marker position is
+    // wrong, not the entry missing; advance that marker to its next
+    // occurrence and rebuild. Each move strictly increases an index,
+    // so this terminates.
+    for (let iter = 0; iter < 20; iter++) {
+      const built = build(markers);
+      const bad = built.rawEntries.find((e) => isFooterOnlyEntry(e.text));
+      if (!bad) break;
+      const mk = markers.find((m) => m.n === bad.n);
+      const re = makeRe(mk.n);
+      re.lastIndex = mk.idx + 1;
+      const m2 = re.exec(zone);
+      if (!m2) break;
+      mk.idx = m2.index;
+    }
+    const built = build(markers);
+    return { style: "numeric", entries: built.entries, keys: built.keys, count: built.count };
+  };
+  // What may follow the marker: any Unicode letter (\\p{L}) — the old
+  // [A-Za-z] class stopped the 421 genetics chain at 115 because
+  // entry 116 starts "Øvretveit", merging 116-125 into entry 115 —
+  // or a number-word title start ("62. 7 Cups ...": the 315 chain
+  // stopped at 61 because entry 62 starts with a digit, merging
+  // 62-92 into entry 61). The digit form requires a space + letter
+  // after the digits, so decimals ("3.5") still do not match.
+  // Tried in order: dotted lists first (existing behaviour), then
+  // bracketed lists "[1] ...", which previously returned no list.
+  return tryChain((n) => new RegExp(`(?<!\\d)${n}\\.(?:\\s*\\p{L}|\\s+\\d+\\s+\\p{L})`, "gu"))
+    || tryChain((n) => new RegExp(`\\[${n}\\](?:\\s*\\p{L}|\\s+\\d+\\s+\\p{L})`, "gu"));
 }
 
 function parseAuthorYearZone(zone) {
@@ -89,7 +125,16 @@ function parseAuthorYearZone(zone) {
       const parenYear = current.match(/\(((?:19|20)\d{2})\)/);
       const plainYear = current.match(/^[^,;]+,\s*((?:19|20)\d{2})\b/);
       const year = parenYear ? parenYear[1] : (plainYear ? plainYear[1] : null);
-      if (year && currentSurname) entries.push({ text: current, key: `${currentSurname.trim().toLowerCase()}, ${year}` });
+      // Artefact guard (20-paper test, Psychology paper): a fragment
+      // like "(1), 2041" must not become a reference entry. Drop
+      // entries whose author part has no letter at all (a bare
+      // "(1)" or number) or is literally "et al.", and years beyond
+      // next year (a misread volume/page, not a publication year).
+      const sName = (currentSurname || "").trim().toLowerCase();
+      const plausible = year && currentSurname
+        && /[a-zà-ÿ]/.test(sName) && sName !== "et al." && sName !== "et al"
+        && Number(year) <= new Date().getFullYear() + 1;
+      if (plausible) entries.push({ text: current, key: `${currentSurname.trim().toLowerCase()}, ${year}` });
     }
     current = null;
     currentSurname = null;
@@ -150,6 +195,18 @@ export function parseReferences(text) {
 }
 
 export function scanAuthorYearCitations(bodyText) {
+  // PDF extraction wraps lines and mangles ligatures inside citations:
+  // "Fadiji et al.\n,\n2024" (comma wrapped to the next line) and
+  // "Abdellaoui et\x1fal., 2020" (the et-al. ligature surfacing as a
+  // control character) are both real citations the old regexes missed
+  // entirely: on the 20-paper test this dropped Psychology detection
+  // from 92 real citations to 0 and Education from 117 to 6.
+  // Normalise before scanning: control characters (ligature artefacts)
+  // become spaces, and a hyphen at a line break joins the word back.
+  // Newlines themselves are kept: \s in the patterns already spans them.
+  const text = String(bodyText)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ")
+    .replace(/-\n/g, "-");
   const out = [];
   const seen = new Set();
   const push = (surname, year) => {
@@ -161,19 +218,65 @@ export function scanAuthorYearCitations(bodyText) {
   // "Serra & \nKunc, 2015") is NOT its own citation; re3/re4 capture
   // the first author instead. A fixed lookbehind alone fails across
   // the line break, so check the last word before the match.
-  const isSecondAuthor = (idx) => /(?:^|[\s])(&|and)$/.test(String(bodyText).slice(0, idx).trimEnd());
-  const re1 = /\b(?<!& )(?<!and )([A-Z][A-Za-zÀ-ÿ'’\-]+)(?:\s+et al\.?)?,\s*((?:19|20)\d{2})\b/g;
+  const isSecondAuthor = (idx) => /(?:^|[\s])(&|and)$/.test(text.slice(0, idx).trimEnd());
+  const re1 = /\b(?<!& )(?<!and )([A-Z][A-Za-zÀ-ÿ'’\-]+)(?:\s+et al\.?)?\s*,\s*((?:19|20)\d{2})\b/g;
   let m;
-  while ((m = re1.exec(bodyText)) !== null) { if (!isSecondAuthor(m.index)) push(m[1], m[2]); }
+  while ((m = re1.exec(text)) !== null) { if (!isSecondAuthor(m.index)) push(m[1], m[2]); }
   const re2 = /\b(?<!& )(?<!and )([A-Z][A-Za-zÀ-ÿ'’\-]+)(?:\s+et al\.?)?\s*\(((?:19|20)\d{2})\)/g;
-  while ((m = re2.exec(bodyText)) !== null) { if (!isSecondAuthor(m.index)) push(m[1], m[2]); }
+  while ((m = re2.exec(text)) !== null) { if (!isSecondAuthor(m.index)) push(m[1], m[2]); }
   // APA two-author citations: only the FIRST author keys the entry,
   // so "(Serra & Kunc, 2015)" and "Serra and Kunc (2015)" must yield
   // "serra, 2015", not "kunc, 2015" (which would false-flag both ways).
-  const re3 = /\b([A-Z][A-Za-zÀ-ÿ'’\-]+)\s+(?:&|and)\s+[A-Z][A-Za-zÀ-ÿ'’\-]+,\s*((?:19|20)\d{2})\b/g;
+  const re3 = /\b([A-Z][A-Za-zÀ-ÿ'’\-]+)\s+(?:&|and)\s+[A-Z][A-Za-zÀ-ÿ'’\-]+\s*,\s*((?:19|20)\d{2})\b/g;
   while ((m = re3.exec(bodyText)) !== null) push(m[1], m[2]);
   const re4 = /\b([A-Z][A-Za-zÀ-ÿ'’\-]+)\s+(?:&|and)\s+[A-Z][A-Za-zÀ-ÿ'’\-]+\s*\(((?:19|20)\d{2})\)/g;
   while ((m = re4.exec(bodyText)) !== null) push(m[1], m[2]);
+  return out;
+}
+
+// Citing-sentence contexts for the Wonder cross-check: for each distinct
+// author-year key found by scanAuthorYearCitations, the sentence that
+// contains its first occurrence (bounded by sentence terminators or
+// 300 characters each way). The cross-check needs the sentence because
+// a cited key alone cannot distinguish two same-surname same-year
+// entries; without it, a model pick would be a guess, not evidence.
+// Same normalisation and patterns as scanAuthorYearCitations, so the
+// keys here match that scan exactly.
+export function scanAuthorYearCitationContexts(bodyText) {
+  const text = String(bodyText)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ")
+    .replace(/-\n/g, "-");
+  const out = [];
+  const seen = new Set();
+  const sentenceAround = (idx, len) => {
+    let start = idx;
+    const back = text.slice(Math.max(0, idx - 300), idx);
+    const bm = back.match(/[.!?][\s\n]+[^\s\n]*$/);
+    if (bm) start = Math.max(0, idx - 300) + bm.index + bm[0].length;
+    else start = Math.max(0, idx - 300);
+    let end = idx + len;
+    const fwd = text.slice(idx + len, idx + len + 300);
+    const fm = fwd.match(/[.!?](?:\s|$)/);
+    if (fm) end = idx + len + fm.index + 1;
+    else end = Math.min(text.length, idx + len + 300);
+    return text.slice(start, end).replace(/\s+/g, " ").trim();
+  };
+  const push = (surname, year, idx, len) => {
+    const key = `${surname.trim().toLowerCase()}, ${year}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ key, sentence: sentenceAround(idx, len) });
+  };
+  const isSecondAuthor = (idx) => /(?:^|[\s])(&|and)$/.test(text.slice(0, idx).trimEnd());
+  let m;
+  const re1 = /\b(?<!& )(?<!and )([A-Z][A-Za-zÀ-ÿ'’\-]+)(?:\s+et al\.?)?\s*,\s*((?:19|20)\d{2})\b/g;
+  while ((m = re1.exec(text)) !== null) { if (!isSecondAuthor(m.index)) push(m[1], m[2], m.index, m[0].length); }
+  const re2 = /\b(?<!& )(?<!and )([A-Z][A-Za-zÀ-ÿ'’\-]+)(?:\s+et al\.?)?\s*\(((?:19|20)\d{2})\)/g;
+  while ((m = re2.exec(text)) !== null) { if (!isSecondAuthor(m.index)) push(m[1], m[2], m.index, m[0].length); }
+  const re3 = /\b([A-Z][A-Za-zÀ-ÿ'’\-]+)\s+(?:&|and)\s+[A-Z][A-Za-zÀ-ÿ'’\-]+\s*,\s*((?:19|20)\d{2})\b/g;
+  while ((m = re3.exec(text)) !== null) push(m[1], m[2], m.index, m[0].length);
+  const re4 = /\b([A-Z][A-Za-zÀ-ÿ'’\-]+)\s+(?:&|and)\s+[A-Z][A-Za-zÀ-ÿ'’\-]+\s*\(((?:19|20)\d{2})\)/g;
+  while ((m = re4.exec(text)) !== null) push(m[1], m[2], m.index, m[0].length);
   return out;
 }
 

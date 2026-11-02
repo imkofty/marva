@@ -14,6 +14,13 @@
 // as body text, so they are never marked. Marked numbers are the
 // ONLY superscript citations the matcher may use; bare numbers in
 // plain text are never treated as citations.
+// Memory bound (2026-10-29 fix for Worker 1102 upload failures): the old
+// version built one token object per operator/number of every stream, so
+// PDFs with 10-45 MB inflated streams (the five 20-paper upload failures)
+// blew the 128 MB Worker limit while smaller PDFs worked. Tokenising is
+// now lazy (generator, one token alive at a time) and image streams are
+// skipped before inflation, so peak memory is bounded by the largest
+// single text stream, not by the sum of all tokens.
 // It does NOT handle scanned images, encrypted PDFs, hex-string text,
 // or embedded fonts with custom encodings: those return what could
 // be extracted, and the caller must report the limit honestly, never
@@ -24,8 +31,7 @@ function decodePdfString(s) {
   return s.replace(/\\([()\\])/g, "$1").replace(/\\([0-7]{1,3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
 }
 
-function tokenize(data) {
-  const toks = [];
+function* tokenize(data) {
   let i = 0;
   while (i < data.length) {
     const c = data[i];
@@ -42,16 +48,16 @@ function tokenize(data) {
         if (depth > 0) buf += ch;
         j++;
       }
-      toks.push({ t: "str", v: decodePdfString(buf) });
+      yield { t: "str", v: decodePdfString(buf) };
       i = j;
       continue;
     }
-    if (c === "[") { toks.push({ t: "[", v: "[" }); i++; continue; }
-    if (c === "]") { toks.push({ t: "]", v: "]" }); i++; continue; }
+    if (c === "[") { yield { t: "[", v: "[" }; i++; continue; }
+    if (c === "]") { yield { t: "]", v: "]" }; i++; continue; }
     if (c === "/") {
       let j = i + 1;
       while (j < data.length && !/[\s\[\]()<>/%]/.test(data[j])) j++;
-      toks.push({ t: "name", v: data.slice(i, j) });
+      yield { t: "name", v: data.slice(i, j) };
       i = j;
       continue;
     }
@@ -59,14 +65,12 @@ function tokenize(data) {
     while (j < data.length && !/[\s\[\]()<>/%]/.test(data[j])) j++;
     if (j === i) j++;
     const w = data.slice(i, j);
-    toks.push({ t: /^-?\d+(\.\d+)?$/.test(w) ? "num" : "op", v: w });
+    yield { t: /^-?\d+(\.\d+)?$/.test(w) ? "num" : "op", v: w };
     i = j;
   }
-  return toks;
 }
 
 function extractRuns(data) {
-  const toks = tokenize(data);
   const runs = [];
   let stack = [];
   let arr = null;
@@ -75,7 +79,7 @@ function extractRuns(data) {
   const emit = (text) => {
     if (text) runs.push({ text, size: fontSize * Math.hypot(textM[0], textM[1]) || fontSize, rise, x: textM[4], y: textM[5] });
   };
-  for (const tk of toks) {
+  for (const tk of tokenize(data)) {
     if (tk.t === "[") { arr = []; continue; }
     if (tk.t === "]") { stack.push({ t: "arr", v: arr }); arr = null; continue; }
     if (arr !== null) { arr.push(tk); continue; }
@@ -130,12 +134,24 @@ function markSuperscripts(runs) {
     if (!/^\d{1,3}$/.test(r.text.trim())) return r.text;
     if (r.rise > 0.5) return `\u0001${r.text.trim()}\u0002`;
     if (bodySize > 0 && r.size > 0 && r.size < bodySize * 0.85) {
-      // Raised above the previous body run in the same stream?
-      // Runs are in stream order, so look back at most 3 runs.
-      for (let j = i - 1; j >= Math.max(0, i - 3); j--) {
-        const prev = runs[j];
-        if (prev.text.length >= 10 && prev.size >= bodySize * 0.9) {
-          const dy = r.y - prev.y;
+      // Raised above a neighbouring body line? Stream order scrambles
+      // two-column layouts, so the digit's own line may sit AFTER it
+      // in stream order (315: digit y=262.7, following line y=258.2,
+      // raised by 4.5) as well as before it. Check the nearest long
+      // body run in either direction (up to 6 runs out); a digit
+      // sitting 1-6 units above that line's baseline is a superscript
+      // citation. Rise (Ts) above already returned above.
+      const isBodyLine = (x) => x.text.length >= 10 && x.size >= bodySize * 0.9;
+      for (let j = i - 1; j >= Math.max(0, i - 6); j--) {
+        if (isBodyLine(runs[j])) {
+          const dy = r.y - runs[j].y;
+          if (dy >= 1 && dy <= 6) return `\u0001${r.text.trim()}\u0002`;
+          break;
+        }
+      }
+      for (let j = i + 1; j <= Math.min(runs.length - 1, i + 6); j++) {
+        if (isBodyLine(runs[j])) {
+          const dy = r.y - runs[j].y;
           if (dy >= 1 && dy <= 6) return `\u0001${r.text.trim()}\u0002`;
           break;
         }
@@ -151,6 +167,10 @@ export function extractTextFromPdf(buffer) {
   const streamRe = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
   let m;
   while ((m = streamRe.exec(raw)) !== null) {
+    // Image XObjects inflate to full raster size (tens of MB) and can
+    // never contain text operators: skip them before inflating.
+    const dictAt = raw.lastIndexOf("<<", m.index);
+    if (dictAt >= 0 && m.index - dictAt < 4000 && /\/Subtype\s*\/Image/.test(raw.slice(dictAt, m.index))) continue;
     let data;
     try { data = inflateSync(Buffer.from(m[1], "latin1")).toString("latin1"); }
     catch { data = m[1]; }

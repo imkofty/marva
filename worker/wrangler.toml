@@ -13,3 +13,15 @@ compatibility_flags = ["nodejs_compat"]
 [[kv_namespaces]]
 binding = "MARVA_JOBS"
 id = "f84f03264db8463eb60f09b7b94c7b9a"
+
+# Durable Object per job (execution engine since 2026-10-29).
+# NOTE: deploys go through cf-worker-deploy.py, which sets these
+# bindings in the upload metadata; this file documents the same shape
+# for wrangler-based deploys.
+[[durable_objects.bindings]]
+name = "JOB_OBJECTS"
+class_name = "JobObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["JobObject"]

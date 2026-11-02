@@ -8,6 +8,7 @@ export async function checkByDOI(doi, fetchImpl = fetch) {
   if (!doi || !doi.includes("/")) return { status: "unresolved", reason: "No DOI" };
   try {
     const res = await fetchImpl(`https://api.crossref.org/works/${encodeURIComponent(doi)}`, { headers: { Accept: "application/json" }, signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined });
+    if (res.status === 429) return { status: "inconclusive", reason: "Crossref 429 rate limit" };
     if (!res.ok) return { status: "unresolved", reason: `Crossref ${res.status}` };
     const data = await res.json();
     const m = data.message || {};
@@ -19,6 +20,7 @@ export async function checkByTitle(title, fetchImpl = fetch) {
   if (!title) return { status: "unresolved", reason: "No title" };
   try {
     const res = await fetchImpl(`https://api.openalex.org/works?search=${encodeURIComponent(title)}&per-page=1`, { headers: { Accept: "application/json" }, signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined });
+    if (res.status === 429) return { status: "inconclusive", reason: "OpenAlex 429 rate limit" };
     if (!res.ok) return { status: "unresolved", reason: `OpenAlex ${res.status}` };
     const data = await res.json();
     const w = (data.results || [])[0];

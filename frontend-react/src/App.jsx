@@ -44,6 +44,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [pasteText, setPasteText] = useState("");
   const pollRef = useRef(null);
+  const jobIdRef = useRef(null);
+  const statusRef = useRef(null);
+  const resumeRef = useRef(null);
 
   const saveHistory = (list) => {
     setHistory(list);
@@ -59,12 +62,18 @@ export default function App() {
     pollRef.current = null;
   };
 
-  // Poll GET /jobs/:id/events every 2s until done, then fetch the job
+  // Poll GET /jobs/:id/events every 30s until done, then fetch the job
   // for its report. The backend currently serves JSON here; if it ever
   // serves text/event-stream, this polling still works because the
   // JSON endpoint is the documented one.
+  // 30s (not 2s) + pause while hidden: 2s polling from an open tab
+  // burned through the Durable Object free-tier daily quota and throttled
+  // all polling (1 Nov 2026). A verifier advancing every ~10 min does not
+  // need 2s freshness; 30s keeps a multi-hour run far under quota.
   const pollJob = useCallback((id) => {
     stopPolling();
+    jobIdRef.current = id;
+    statusRef.current = "running";
     setJobId(id);
     setJobStatus("running");
     setEvents([]);
@@ -74,6 +83,7 @@ export default function App() {
         const data = await fetchEvents(id);
         setEvents(data.events || []);
         setJobStatus(data.status || "running");
+        statusRef.current = data.status || "running";
         if (data.status && data.status !== "running") {
           stopPolling();
           const job = await fetchJob(id);
@@ -90,10 +100,32 @@ export default function App() {
       }
     };
     tick();
-    pollRef.current = setInterval(tick, 2000);
+    pollRef.current = setInterval(tick, 30000);
+    resumeRef.current = () => {
+      stopPolling();
+      tick();
+      pollRef.current = setInterval(tick, 30000);
+    };
   }, []);
 
   useEffect(() => () => stopPolling(), []);
+
+  // Pause polling while the tab is hidden; resume (with an immediate
+  // refresh) when it becomes visible again, but only while the job is
+  // still running. A hidden tab must not keep burning backend quota.
+  useEffect(() => {
+    const onVis = () => {
+      if (document.hidden) {
+        stopPolling();
+        return;
+      }
+      if (jobIdRef.current && statusRef.current === "running" && !pollRef.current && resumeRef.current) {
+        resumeRef.current();
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
 
   const startPdf = async (file) => {
     if (!file) return;
