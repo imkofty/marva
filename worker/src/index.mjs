@@ -36,14 +36,15 @@
 // still reads the KV `active` key, so two POSTs arriving in the same
 // instant could both pass the gate check; that residual demo
 // limitation (not the stage race) remains.
-import { extractReferenceKey, normalizeKey, matchAuthorYearKeys } from "./citation-matcher.mjs";
+import { extractReferenceKey, normalizeKey, matchAuthorYearKeys, resolveIbidKeys } from "./citation-matcher.mjs";
 import { parseReferences, scanAuthorYearCitations, scanAuthorYearCitationContexts, scanBracketCitations, scanSuperscriptCitations, splitMarkedBody, stripMarkerChars } from "./reference-parser.mjs";
 import { runAgent, escalateAmbiguous } from "./agents.mjs";
 import { runCrosscheck } from "./crosscheck.mjs";
-import { extractTextFromPdf } from "./pdf.mjs";
+import { analyzePdf, SCANNED_PDF_REASON } from "./pdf.mjs";
 import { verifyReference, searchStrengthening, extractDOI } from "./strengthening.mjs";
 import { withOpenAlexKey } from "./database.mjs";
-import { buildVenueRecommendations } from "./journal-evidence.mjs";
+import { createQuotaCounter, snapshotQuota, quotaBudget, checkStrengtheningQuota } from "./quota.mjs";
+import { buildVenueRecommendations, buildJournalRecommendations, mergeFieldCandidates } from "./journal-evidence.mjs";
 import { buildReport, buildReportHTML, buildReportPDF } from "./export.mjs";
 import { loadJob, saveJob, loadActive, saveActive, clearActiveIf, deleteJob } from "./store.mjs";
 import { SYNTHETIC_DEMO } from "./demo.mjs";
@@ -247,10 +248,41 @@ export async function runStage(env, job, stage, text, deps = {}) {
   const apiKey = deps.apiKey !== undefined ? deps.apiKey : (env.MODEL_API_KEY || "");
   const hasKey = !!apiKey && apiKey !== "REPLACE_AT_DEPLOY_VIA_WRANGLER_SECRET";
   const agentDeps = { fetchImpl, apiKey: hasKey ? apiKey : "" };
+  // Per-job OpenAlex usage counter (quota.mjs): a plain object on the
+  // job, so it persists with the job across DO alarm steps and
+  // accumulates across verifier batches. Additive only — stages that
+  // never touch a database simply leave it at zero. Old jobs loaded
+  // from storage without a counter get one on their next stage.
+  const quota = job.quota || (job.quota = createQuotaCounter());
+  // Scanned-PDF gate (2026-11-03): a PDF with no text layer has no
+  // manuscript text for any text-dependent stage. Skipping them with
+  // the recorded reason beats letting a model invent findings from
+  // empty input. The verifier is NOT gated: it needs only the
+  // reference list (possibly author-provided), and its verdicts come
+  // from database DOI matches, never from the missing text.
+  // Strengthening skips itself (no gap theories). One scanned job
+  // touches nothing outside its own record, so other jobs are
+  // unaffected.
+  const SCANNED_GATED_STAGES = new Set(["reader", "citation_matcher", "gap", "journal", "supervisor"]);
+  if (job.pdf_scanned && SCANNED_GATED_STAGES.has(stage)) {
+    await pushEvent(env, job, { stage, status: "skipped", detail: SCANNED_PDF_REASON });
+    return;
+  }
   if (stage === "reader") {
+    if (job.pdf_encrypted) {
+      // The bytes could not be read at all: report the reader stage
+      // skipped with the exact reason, never "done" on empty text.
+      // Later stages see zero references and skip honestly; the
+      // matcher preserves this status (see citation_matcher below).
+      job.citation_status = "skipped_encrypted";
+      job.citation_note = "PDF terenkripsi, tidak bisa dibuka. Pemeriksaan sitasi dilewati; dimensi ini tidak dinilai.";
+      await pushEvent(env, job, { stage: "reader", status: "skipped", detail: "PDF terenkripsi, tidak bisa dibuka" });
+      return;
+    }
     if (text) {
       // Deterministic parsing first, model second. References come
-      // from the document tail parser, never from the model; citations
+      // from the document tail parser (or footnote entries when no
+      // tail section exists), never from the model; citations
       // come from code scanning the BODY (never the reference zone),
       // unioned with whatever the Reader model reports.
       const plainText = stripMarkerChars(text);
@@ -273,6 +305,7 @@ export async function runStage(env, job, stage, text, deps = {}) {
         job.references = parsed.entries;
         job.reference_keys = parsed.keys;
         job.reference_style = parsed.style;
+        if (parsed.style === "footnote") job.footnote_repeats = parsed.footnote_repeats || 0;
         job.citation_status = "parsed";
         job.citation_note = null;
       } else if (providedReferences.length > 0) {
@@ -321,6 +354,11 @@ export async function runStage(env, job, stage, text, deps = {}) {
     // Deterministic, never a model. Mode is chosen from what was
     // actually found, never guessed:
     //  - author-year list -> match author-year keys.
+    //  - footnote list -> match author-year keys. Footnote numbers
+    //    restart per page, so they are never numeric keys, and body
+    //    footnote markers are not citations into the list; the
+    //    superscript scan is ignored in this mode (the author-year
+    //    branch below uses the body author-year scan only).
     //  - numeric list + bracket citations -> match numbers.
     //  - numeric list + marked superscript -> match marked numbers.
     //  - numeric list + neither -> SKIP honestly. Bare numbers in
@@ -329,9 +367,12 @@ export async function runStage(env, job, stage, text, deps = {}) {
     //  - no references at all -> SKIP with skipped_no_references.
     const refs = job.references || [];
     if (refs.length === 0) {
-      job.citation_status = "skipped_no_references";
+      // An encrypted PDF keeps its own skip status end to end: the
+      // reason is the encryption, not a missing reference list.
+      const encrypted = job.citation_status === "skipped_encrypted";
+      if (!encrypted) job.citation_status = "skipped_no_references";
       job.citation_note = job.citation_note || "No reference list was found in the document. Citation checking was skipped; this dimension is not scored.";
-      job.result = { missing: [], uncited: [], duplicates: [], status: "skipped_no_references", note: job.citation_note };
+      job.result = { missing: [], uncited: [], duplicates: [], status: encrypted ? "skipped_encrypted" : "skipped_no_references", note: job.citation_note };
       await pushEvent(env, job, { stage: "citation_matcher", status: "skipped", detail: job.citation_note, result: job.result });
       return;
     }
@@ -348,7 +389,7 @@ export async function runStage(env, job, stage, text, deps = {}) {
         await pushEvent(env, job, { stage: "citation_matcher", status: "skipped", detail: job.citation_note, result: job.result });
         return;
       }
-    } else if (job.reference_keys && job.reference_style === "author-year") {
+    } else if (job.reference_keys && (job.reference_style === "author-year" || job.reference_style === "footnote")) {
       listedKeys = job.reference_keys;
       // Cited keys come ONLY from code scanning the body. The Reader
       // model's citation strings are deliberately excluded here:
@@ -359,7 +400,7 @@ export async function runStage(env, job, stage, text, deps = {}) {
       // scan alone gave the correct 5. A model citation is not
       // evidence of a body citation; the scan is.
       citedKeys = [...new Set(scanned.author_year || [])];
-      mode = "author-year";
+      mode = job.reference_style === "footnote" ? "footnote" : "author-year";
       // Parser author-year lists use last-word surname matching
       // (text "Souza" for listed "De Souza", "Bank" for "World Bank").
       // matchAuthorYearKeys returns missing/uncited directly, so
@@ -385,14 +426,19 @@ export async function runStage(env, job, stage, text, deps = {}) {
           crosscheck.skipped = "MODEL_API_KEY not set; ambiguous cases stay flagged.";
         }
       }
-      job.result = { missing, uncited, duplicates: ayMatched.duplicates, ambiguous: ayMatched.ambiguous, crosscheck, status: "done", mode };
+      job.result = { missing, uncited, duplicates: ayMatched.duplicates, ambiguous: ayMatched.ambiguous, crosscheck, status: "done", mode, ...(job.reference_style === "footnote" ? { footnote_repeats: job.footnote_repeats || 0 } : {}) };
       job.result.uncited_references = refs.filter((r, idx) => uncited.includes(listedKeys[idx]));
       job.citation_status = "done";
       job.citation_note = null;
       await pushEvent(env, job, { stage: "citation_matcher", status: "done", detail: `Missing: ${missing.length}, uncited: ${uncited.length}, duplicates: ${ayMatched.duplicates.length} (mode: ${mode}; crosscheck: ${crosscheck.proposed} proposed, ${crosscheck.accepted.length} accepted by code validation, ${crosscheck.rejected.length} rejected, ${crosscheck.abstained.length} abstained${crosscheck.skipped ? "; crosscheck skipped: no model key" : ""})`, result: job.result });
       return;
     } else {
-      listedKeys = refs.map(extractReferenceKey);
+      // Provided references have no parser keys, so ibid/op. cit.
+      // entries arrive as raw keys ("ibid, 2021", "smith, op. cit.")
+      // and must be resolved list-level before matching — and the
+      // uncited display filter must compare resolved keys by index,
+      // or resolved entries would vanish from the display list.
+      listedKeys = resolveIbidKeys(refs.map(extractReferenceKey));
       citedKeys = (job.citations || []).map(normalizeKey);
       mode = "author-year";
     }
@@ -413,7 +459,7 @@ export async function runStage(env, job, stage, text, deps = {}) {
         job.result.list_note = `The parsed reference list ends at ${listedKeys.length}, but the body cites up to [${maxCited}]: the tail of the list was not parsed (merged entries or an unrecognised list format), so the ${matched.missing.length} "missing" numbers above are unconfirmed, not proven absent.`;
       }
     } else {
-      job.result.uncited_references = refs.filter((r) => matched.uncited.includes(extractReferenceKey(r)));
+      job.result.uncited_references = refs.filter((r, idx) => matched.uncited.includes(listedKeys[idx]));
     }
     job.citation_status = "done";
     job.citation_note = null;
@@ -473,7 +519,7 @@ export async function runStage(env, job, stage, text, deps = {}) {
           } catch { v = null; }
         }
         if (!v) {
-          v = await verifyReference(ref, fetchImpl);
+          v = await verifyReference(ref, fetchImpl, quota);
           if (v.status === "inconclusive") {
             prog.inconclusive.push({ reference: ref, reason: v.db?.reason || "rate limited" });
             prog.pos += 1;
@@ -582,11 +628,26 @@ export async function runStage(env, job, stage, text, deps = {}) {
       for (const t of job.gap?.missing_theories || []) terms.push(t.name);
       for (const t of job.gap?.rival_theories || []) terms.push(t.name);
       if (terms.length === 0) {
-        job.strengthening = { skipped: true, reason: "No gap theories to search for", recommendations: [] };
+        job.strengthening = { skipped: true, reason: "No gap theories to search for", recommendations: [], quota: snapshotQuota(quota) };
         await pushEvent(env, job, { stage: "strengthening", status: "skipped", detail: "No gap theories to search for" });
       } else {
-        job.strengthening = await searchStrengthening(terms, fetchImpl);
-        await pushEvent(env, job, { stage: "strengthening", status: "done", detail: `Recommendations: ${job.strengthening.recommendations.length} (verified or candidate only), dropped unresolved: ${job.strengthening.dropped_unresolved}, dropped inconclusive: ${job.strengthening.dropped_inconclusive}` });
+        // Reservation (quota.mjs): estimate the worst-case OpenAlex
+        // cost BEFORE spending anything. If the job's usage plus
+        // that estimate exceeds the budget, the stage is skipped
+        // with reason "quota_reserved" — recorded in the report,
+        // never a silent zero. With no budget configured
+        // (budget 0), this check never fires and the stage runs
+        // exactly as before.
+        const budget = quotaBudget(env, deps);
+        const check = checkStrengtheningQuota({ quota, budget, terms });
+        if (check.reserved) {
+          job.strengthening = { skipped: true, reason: "quota_reserved", recommendations: [], quota: snapshotQuota(quota), quota_budget: budget, quota_estimate: check.estimate };
+          await pushEvent(env, job, { stage: "strengthening", status: "skipped", detail: `Strengthening skipped: OpenAlex quota reserved (used ${check.used}/${budget} OpenAlex calls, estimated cost ${check.estimate} for ${Math.min(terms.filter(Boolean).length, 2)} term(s))` });
+        } else {
+          job.strengthening = await searchStrengthening(terms, fetchImpl, quota);
+          job.strengthening.quota = snapshotQuota(quota);
+          await pushEvent(env, job, { stage: "strengthening", status: "done", detail: `Recommendations: ${job.strengthening.recommendations.length} (verified or candidate only), dropped unresolved: ${job.strengthening.dropped_unresolved}, dropped inconclusive: ${job.strengthening.dropped_inconclusive}` });
+        }
       }
     } catch (e) {
       job.strengthening = null;
@@ -604,24 +665,37 @@ export async function runStage(env, job, stage, text, deps = {}) {
         if (j.data) {
           job.journal = { ...j.data, scopus_indexed_status: "unverified" };
           // Journal recommendations, submission version (P6 fix,
-          // 2026-11-02): venues of this paper's own DOI-verified
-          // references ONLY — zero new searches, so this stage cannot
-          // 429. The old OpenAlex field-search path
-          // (buildJournalRecommendations) is deliberately NOT used for
-          // naming here: it failed silently at the end of the pipeline
-          // in every completed job, and naming from per-page=3 field
-          // searches without an evidence threshold is soft fabrication.
-          // It stays exported (and tested) for reference, but the
-          // submission naming source is the citation trail.
+          // 2026-11-02) + field-candidate rehabilitation (2026-11-03):
+          // naming comes ONLY from venues of this paper's own
+          // DOI-verified references (threshold 2, citation trail).
+          // OpenAlex field search runs again, but ONLY as an
+          // additional candidate source: a field candidate is merely
+          // annotated onto an already-named venue, and an unverified
+          // field candidate is dropped in diagnostics, never named.
+          // Field search uses the keyed fetch, and a field-search
+          // failure is contained (field_search: "failed") — it never
+          // fails the stage and never changes the named set.
           try {
             const venue = buildVenueRecommendations(job.verifier?.verified_venues || [], j.data.fields || []);
-            job.journal_recommendations = venue.recommendations;
-            job.journal_diagnostics = venue.diagnostics;
+            let merged = null;
+            try {
+              const field = await buildJournalRecommendations(j.data.fields || [], fetchImpl);
+              merged = mergeFieldCandidates(venue, field.recommendations || []);
+            } catch {
+              merged = null;
+            }
+            if (merged) {
+              job.journal_recommendations = merged.recommendations;
+              job.journal_diagnostics = merged.diagnostics;
+            } else {
+              job.journal_recommendations = venue.recommendations;
+              job.journal_diagnostics = { ...venue.diagnostics, field_search: { status: "failed", reason: "Field search failed; citation-trail naming unaffected." } };
+            }
           } catch {
             job.journal_recommendations = [];
             job.journal_diagnostics = null;
           }
-          await pushEvent(env, job, { stage: "journal", status: "done", detail: `Fields: ${(j.data.fields || []).map((f) => f.name).join(", ") || "none"}; journal recommendations: ${(job.journal_recommendations || []).length} (citation-trail evidence only)` });
+          await pushEvent(env, job, { stage: "journal", status: "done", detail: `Fields: ${(j.data.fields || []).map((f) => f.name).join(", ") || "none"}; journal recommendations: ${(job.journal_recommendations || []).length} (citation-trail naming; field candidates corroborated: ${(job.journal_diagnostics?.field_search?.corroborated || []).length}, dropped unverified: ${(job.journal_diagnostics?.field_search?.dropped_unverified || []).length})` });
         } else {
           job.journal = null;
           await pushEvent(env, job, { stage: "journal", status: "failed", detail: j.error || "Journal failed" });
@@ -703,13 +777,30 @@ export default {
         }
         let text = "";
         let pdf_note = null;
+        let pdf_scanned = false;
+        let pdf_encrypted = false;
+        let extraction = null;
         if (typeof data.text === "string") text = data.text;
         else if (typeof data.pdfBase64 === "string") {
           try {
-            text = extractTextFromPdf(base64ToBuffer(data.pdfBase64));
-            if (!text) pdf_note = "PDF text extraction returned no text; scanned-image and encrypted PDFs are not readable by this extractor.";
+            // One analysis serves all three PDF concerns: encryption
+            // (flag + explicit reason, never scanned), scanned
+            // (flag + reason + citation skip below), and P7
+            // extraction status (partial note + job record).
+            const pdf = analyzePdf(base64ToBuffer(data.pdfBase64));
+            text = pdf.text;
+            extraction = pdf.extraction || null;
+            if (pdf.encrypted) { pdf_encrypted = true; pdf_note = "PDF terenkripsi, tidak bisa dibuka"; }
+            else if (pdf.scanned) { pdf_scanned = true; pdf_note = pdf.reason; }
+            else if (!text) { pdf_note = "PDF text extraction returned no text; scanned-image PDFs are not readable by this extractor."; }
+            else if (pdf.extraction && pdf.extraction.status === "partial") { pdf_note = `PDF extraction partial: ${pdf.extraction.reason}.`; }
           } catch (e) {
-            pdf_note = `PDF extraction failed: ${String(e.message || e).slice(0, 200)}`;
+            if (e && e.code === "PDF_ENCRYPTED") {
+              pdf_note = "PDF terenkripsi, tidak bisa dibuka";
+              pdf_encrypted = true;
+            } else {
+              pdf_note = `PDF extraction failed: ${String(e.message || e).slice(0, 200)}`;
+            }
           }
         }
         const job = {
@@ -719,8 +810,16 @@ export default {
           reader: null, result: null, verifier: null, gap: null,
           journal: null, supervisor: null, strengthening: null,
           confirmed: false, next_stage: 1, advancing_until: 0,
-          partial: false, pdf_note, updatedAt: Date.now(),
+          partial: false, pdf_note, pdf_scanned, ...(pdf_encrypted ? { pdf_encrypted: true } : {}), extraction, updatedAt: Date.now(),
         };
+        // A scanned PDF has no text for the citation stage either:
+        // record the skip reason up front so the report's References
+        // dimension carries it (dimensions treat any "skipped*"
+        // citation_status as unscored for citation matching).
+        if (pdf_scanned) {
+          job.citation_status = "skipped_scanned_pdf";
+          job.citation_note = SCANNED_PDF_REASON;
+        }
         await saveJob(env, job);
         await saveActive(env, job.id);
         // Step-wise: run Reader synchronously here (only stage that

@@ -4,8 +4,11 @@
 // A reference is verified only when the database returns a matching
 // title/authors/year; anything else is flagged or unresolved, never
 // presented as verified.
-export async function checkByDOI(doi, fetchImpl = fetch) {
+export async function checkByDOI(doi, fetchImpl = fetch, counter = null) {
   if (!doi || !doi.includes("/")) return { status: "unresolved", reason: "No DOI" };
+  // Quota counter (optional, additive): only a real outgoing call
+  // counts — validation failures above never touch the network.
+  if (counter) counter.crossref_doi_lookups = (counter.crossref_doi_lookups || 0) + 1;
   try {
     const res = await fetchImpl(`https://api.crossref.org/works/${encodeURIComponent(doi)}`, { headers: { Accept: "application/json" }, signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined });
     if (res.status === 429) return { status: "inconclusive", reason: "Crossref 429 rate limit" };
@@ -34,8 +37,11 @@ export function withOpenAlexKey(fetchImpl, apiKey) {
   };
 }
 
-export async function checkByTitle(title, fetchImpl = fetch) {
+export async function checkByTitle(title, fetchImpl = fetch, counter = null) {
   if (!title) return { status: "unresolved", reason: "No title" };
+  // Quota counter (optional, additive): only a real outgoing call
+  // counts — the empty-title guard above never touches the network.
+  if (counter) counter.openalex_title_lookups = (counter.openalex_title_lookups || 0) + 1;
   try {
     const res = await fetchImpl(`https://api.openalex.org/works?search=${encodeURIComponent(title)}&per-page=1`, { headers: { Accept: "application/json" }, signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined });
     if (res.status === 429) return { status: "inconclusive", reason: "OpenAlex 429 rate limit" };

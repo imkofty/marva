@@ -5,6 +5,7 @@
 // an unverified reference written as certain, or a journal written as
 // Scopus-indexed when its status is unverified.
 import { mapDiagnosticToDimensions } from "./dimensions.mjs";
+import { snapshotQuota } from "./quota.mjs";
 
 export function buildReport(job) {
   const r = job.result || {};
@@ -39,10 +40,14 @@ export function buildReport(job) {
     // are additive — the recommendation lists above are unchanged.
     strengthening_diagnostics: job.strengthening
       ? (job.strengthening.skipped
-        ? { skipped: true, reason: job.strengthening.reason || null }
-        : { terms_considered: job.strengthening.terms_considered ?? null, searched_terms: job.strengthening.searched_terms || [], per_term: job.strengthening.per_term || [], dropped_unresolved: job.strengthening.dropped_unresolved ?? 0, dropped_inconclusive: job.strengthening.dropped_inconclusive ?? 0 })
+        ? { skipped: true, reason: job.strengthening.reason || null, quota: job.strengthening.quota || null, quota_budget: job.strengthening.quota_budget ?? null, quota_estimate: job.strengthening.quota_estimate ?? null }
+        : { terms_considered: job.strengthening.terms_considered ?? null, searched_terms: job.strengthening.searched_terms || [], per_term: job.strengthening.per_term || [], dropped_unresolved: job.strengthening.dropped_unresolved ?? 0, dropped_inconclusive: job.strengthening.dropped_inconclusive ?? 0, quota: job.strengthening.quota || null })
       : null,
     journal_diagnostics: job.journal_diagnostics || null,
+    // Per-job OpenAlex usage (quota.mjs): searches + title lookups
+    // (the OpenAlex pool) + Crossref DOI lookups (separate pool).
+    // Null for jobs that never ran a database stage.
+    quota_usage: job.quota ? snapshotQuota(job.quota) : null,
     // Honest empty-result notes: an empty recommendation list is a
     // real outcome (search failed, or no candidate verified enough),
     // never a bug to hide and never a reason to invent a journal or
@@ -66,7 +71,7 @@ export function buildReport(job) {
 export function buildReportHTML(report) {
   const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
   const dims = (report.dimensions || []).map((d) => `<h3>${esc(d.dimension)} (${d.count})</h3>${d.note ? `<p>${esc(d.note)}</p>` : ""}<pre>${esc(JSON.stringify(d.items, null, 2))}</pre>`).join("");
-  return `<!doctype html><html><head><meta charset="utf-8"><title>MARVA Report</title></head><body><h1>MARVA Report</h1><p>Job: ${esc(report.jobId)}</p><p>Author confirmed: ${report.confirmed ? "yes" : "no"}</p><p>${esc(report.confirmation_note || "")}</p><h2>Per-dimension diagnostic</h2>${dims}<h2>Citation flags</h2><pre>${esc(JSON.stringify(report.citation_flags, null, 2))}</pre><h2>Diagnostic</h2><pre>${esc(JSON.stringify(report.diagnostic, null, 2))}</pre><h2>Strengthening references (verified or candidate only)</h2><pre>${esc(JSON.stringify(report.strengthening_references, null, 2))}</pre><h2>Strengthening diagnostics (why a zero is a zero)</h2><pre>${esc(JSON.stringify(report.strengthening_diagnostics, null, 2))}</pre><h2>Journal diagnostics</h2><pre>${esc(JSON.stringify(report.journal_diagnostics, null, 2))}</pre><h2>Limitations</h2><ul>${report.limitations.map((l) => `<li>${esc(l)}</li>`).join("")}</ul><p>${esc(report.ai_disclosure)}</p></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>MARVA Report</title></head><body><h1>MARVA Report</h1><p>Job: ${esc(report.jobId)}</p><p>Author confirmed: ${report.confirmed ? "yes" : "no"}</p><p>${esc(report.confirmation_note || "")}</p><h2>Per-dimension diagnostic</h2>${dims}<h2>Citation flags</h2><pre>${esc(JSON.stringify(report.citation_flags, null, 2))}</pre><h2>Diagnostic</h2><pre>${esc(JSON.stringify(report.diagnostic, null, 2))}</pre><h2>Strengthening references (verified or candidate only)</h2><pre>${esc(JSON.stringify(report.strengthening_references, null, 2))}</pre><h2>Strengthening diagnostics (why a zero is a zero)</h2><pre>${esc(JSON.stringify(report.strengthening_diagnostics, null, 2))}</pre><h2>Quota usage (OpenAlex, per job)</h2><pre>${esc(JSON.stringify(report.quota_usage, null, 2))}</pre><h2>Journal diagnostics</h2><pre>${esc(JSON.stringify(report.journal_diagnostics, null, 2))}</pre><h2>Limitations</h2><ul>${report.limitations.map((l) => `<li>${esc(l)}</li>`).join("")}</ul><p>${esc(report.ai_disclosure)}</p></body></html>`;
 }
 
 // Minimal PDF export, same text-summary shape as backend-node.

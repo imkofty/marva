@@ -9,6 +9,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import worker, { runJob } from "../src/index.mjs";
 import { JobObject } from "../src/job-object.mjs";
+import { analyzePdf, SCANNED_PDF_REASON, ENCRYPTED_PDF_REASON } from "../src/pdf.mjs";
+import { buildReport } from "../src/export.mjs";
 
 class FakeKV {
   constructor() { this.map = new Map(); }
@@ -796,6 +798,59 @@ test("P6 journal venue: threshold 2 names a journal, below threshold only fields
   assert.equal(v2.diagnostics.venues_found[0].count, 1);
 });
 
+test("Field-candidate merge: verified >=2 still named + annotated, unverified candidate never named", async () => {
+  const { buildVenueRecommendations, mergeFieldCandidates } = await import("../src/journal-evidence.mjs");
+  const venues = [
+    { journal: "MIS Quarterly", doi: "10.1234/a", reference: "Davis, 1989." },
+    { journal: "MIS Quarterly", doi: "10.1234/b", reference: "Venkatesh, 2003." },
+    { journal: "Solo Journal", doi: "10.1234/c", reference: "Solo, 2020." },
+  ];
+  const venue = await buildVenueRecommendations(venues, [{ name: "Information Systems" }]);
+  const merged = mergeFieldCandidates(venue, [
+    { journal: "MIS Quarterly" },
+    { journal: "Solo Journal" },
+    { journal: "Never Cited Journal" },
+    { journal: "mis quarterly" },
+  ]);
+  assert.equal(merged.recommendations.length, 1);
+  assert.equal(merged.recommendations[0].journal, "MIS Quarterly");
+  assert.equal(merged.recommendations[0].verification, "citation-trail");
+  assert.equal(merged.recommendations[0].also_suggested_by_field, true);
+  assert.equal(merged.diagnostics.field_search.status, "ok");
+  assert.equal(merged.diagnostics.field_search.candidates, 3);
+  assert.equal(merged.diagnostics.field_search.corroborated.length, 1);
+  assert.equal(merged.diagnostics.field_search.corroborated[0].verified_count, 2);
+  const dropped = merged.diagnostics.field_search.dropped_unverified.map((d) => d.journal);
+  assert.ok(dropped.includes("Solo Journal"));
+  assert.ok(dropped.includes("Never Cited Journal"));
+  assert.equal(merged.diagnostics.field_search.dropped_unverified.find((d) => d.journal === "Solo Journal").verified_count, 1);
+  assert.equal(merged.diagnostics.field_search.dropped_unverified.find((d) => d.journal === "Never Cited Journal").verified_count, 0);
+});
+
+test("Field-candidate merge cannot lower the threshold: count-1 venue never named even when field-suggested", async () => {
+  const { buildVenueRecommendations, mergeFieldCandidates } = await import("../src/journal-evidence.mjs");
+  const venue = await buildVenueRecommendations([{ journal: "Solo Journal", doi: "10.1234/x", reference: "Solo, 2020." }], [{ name: "Field" }]);
+  const merged = mergeFieldCandidates(venue, [{ journal: "Solo Journal" }]);
+  assert.equal(merged.recommendations.length, 0);
+  assert.equal(merged.diagnostics.threshold, 2);
+  assert.equal(merged.diagnostics.field_search.dropped_unverified.length, 1);
+});
+
+test("Field-candidate merge is annotation-only: named set identical with and without field candidates", async () => {
+  const { buildVenueRecommendations, mergeFieldCandidates } = await import("../src/journal-evidence.mjs");
+  const venues = [
+    { journal: "MIS Quarterly", doi: "10.1234/a", reference: "Davis, 1989." },
+    { journal: "MIS Quarterly", doi: "10.1234/b", reference: "Venkatesh, 2003." },
+  ];
+  const venue = await buildVenueRecommendations(venues, [{ name: "Information Systems" }]);
+  const plain = mergeFieldCandidates(venue, []);
+  const withField = mergeFieldCandidates(venue, [{ journal: "MIS Quarterly" }, { journal: "Other Journal" }]);
+  assert.deepEqual(plain.recommendations.map((r) => r.journal), ["MIS Quarterly"]);
+  assert.deepEqual(withField.recommendations.map((r) => r.journal), ["MIS Quarterly"]);
+  assert.equal(withField.recommendations[0].also_suggested_by_field, true);
+  assert.equal(plain.recommendations[0].also_suggested_by_field, undefined);
+});
+
 test("P6 OpenAlex key wrapper: api_key only on api.openalex.org", async () => {
   const { withOpenAlexKey } = await import("../src/database.mjs");
   const seen = [];
@@ -816,4 +871,810 @@ test("P6 export carries strengthening and journal diagnostics", async () => {
   assert.equal(report.strengthening_diagnostics.per_term[0].search_status, "rate_limited");
   assert.equal(report.journal_diagnostics.source, "citation-trail");
   assert.ok(report.recommendation_notes.join(" ").includes("verified enough"));
+});
+
+
+// --- Scanned-PDF detection (fix-scan, 2026-11-03) ---
+// Synthetic PDFs are uncompressed single-page documents: a scan page
+// (image XObject + Do, no text operators), a text page (Tj), a
+// hex-string text page with a figure image (text operators present,
+// so NOT a scan), and a scan page carrying an /Encrypt marker
+// (encrypted wins over scanned).
+const SCANNED_PDF = `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /XObject /Subtype /Image /Width 10 /Height 10 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 4 >>
+stream
+XXXX
+endstream
+endobj
+5 0 obj
+<< /Length 31 >>
+stream
+q 100 0 0 100 0 0 cm /Im1 Do Q
+endstream
+endobj
+trailer
+<< /Root 1 0 R >>
+`;
+
+const TEXT_PDF = `%PDF-1.4
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >> endobj
+4 0 obj << /Length 60 >> stream
+BT /F1 12 Tf 100 700 Td (Hello world from a text PDF) Tj ET
+endstream endobj
+trailer << /Root 1 0 R >>
+`;
+
+const HEX_TEXT_WITH_IMAGE_PDF = `%PDF-1.4
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im1 4 0 R >> >> /Contents 5 0 R >> endobj
+4 0 obj << /Type /XObject /Subtype /Image /Width 10 /Height 10 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 4 >> stream
+XXXX
+endstream endobj
+5 0 obj << /Length 60 >> stream
+BT /F1 12 Tf 100 700 Td <48656C6C6F> Tj ET q 100 0 0 100 0 0 cm /Im1 Do Q
+endstream endobj
+trailer << /Root 1 0 R >>
+`;
+
+const ENCRYPTED_SCAN_PDF = SCANNED_PDF.replace("<< /Root 1 0 R >>", "<< /Root 1 0 R /Encrypt 9 0 R >>");
+
+test("Scanned PDF: analyzePdf reports scanned with explicit reason; text, hex-text-with-image, and encrypted PDFs do not", () => {
+  const scanned = analyzePdf(Buffer.from(SCANNED_PDF, "latin1"));
+  assert.equal(scanned.text, "");
+  assert.equal(scanned.scanned, true);
+  assert.equal(scanned.imageCount, 1);
+  assert.equal(scanned.reason, SCANNED_PDF_REASON);
+  assert.ok(scanned.reason.includes("PDF hasil scan, tidak ada lapisan teks"));
+
+  const text = analyzePdf(Buffer.from(TEXT_PDF, "latin1"));
+  assert.ok(text.text.includes("Hello world"));
+  assert.equal(text.scanned, false);
+  assert.equal(text.reason, null);
+
+  // Hex-string text is unreadable to this extractor, but it HAS text
+  // operators, so it must never be mislabelled "scanned".
+  const hex = analyzePdf(Buffer.from(HEX_TEXT_WITH_IMAGE_PDF, "latin1"));
+  assert.equal(hex.text, "");
+  assert.equal(hex.scanned, false);
+  assert.equal(hex.reason, null);
+
+  // /Encrypt takes precedence over the scan signal.
+  const enc = analyzePdf(Buffer.from(ENCRYPTED_SCAN_PDF, "latin1"));
+  assert.equal(enc.text, "");
+  assert.equal(enc.scanned, false);
+  assert.equal(enc.encrypted, true);
+  assert.equal(enc.reason, ENCRYPTED_PDF_REASON);
+});
+
+test("Scanned job via runJob: text stages skipped with the reason, dimensions unscored, nothing fabricated", async () => {
+  const env = makeEnv("");
+  const job = {
+    id: "scan-1", status: "running", events: [],
+    citations: [], references: [],
+    reader: null, result: null, verifier: null, gap: null,
+    journal: null, supervisor: null, strengthening: null,
+    confirmed: false, next_stage: 0, advancing_until: 0,
+    partial: false, pdf_note: SCANNED_PDF_REASON, pdf_scanned: true,
+    citation_status: "skipped_scanned_pdf", citation_note: SCANNED_PDF_REASON,
+    updatedAt: Date.now(),
+  };
+  await runJob(env, job, "", {});
+  assert.equal(job.status, "done");
+  assert.equal(job.partial, true);
+  for (const stage of ["reader", "citation_matcher", "gap", "journal", "supervisor"]) {
+    assert.ok(job.events.some((e) => e.stage === stage && e.status === "skipped" && e.detail === SCANNED_PDF_REASON), `${stage} skipped with reason`);
+  }
+  // Verifier still runs (reference list only): 0 refs -> honest 0/0/0/0.
+  assert.deepEqual(job.verifier, { verified: [], verified_venues: [], flagged: [], ambiguous: [], inconclusive: [] });
+  assert.equal(job.supervisor, null);
+  assert.equal(job.gap, null);
+  const report = buildReport(job);
+  assert.deepEqual(report.citation_flags.missing, []);
+  assert.deepEqual(report.citation_flags.uncited, []);
+  assert.equal(report.citation_flags.status, "skipped_scanned_pdf");
+  assert.ok(report.citation_flags.note.includes("PDF hasil scan, tidak ada lapisan teks"));
+  for (const d of report.dimensions) {
+    assert.deepEqual(d.items, [], `${d.dimension} unscored`);
+  }
+  assert.ok(report.dimensions.find((d) => d.dimension === "References").note.includes("PDF hasil scan, tidak ada lapisan teks"));
+  assert.ok(report.limitations.includes(SCANNED_PDF_REASON));
+});
+
+test("POST scanned PDF: 201, full pipeline skips honestly, report carries the reason", async () => {
+  const orig = installFakeFetch();
+  try {
+    const env = makeEnv("");
+    const ctx = makeCtx();
+    const b64 = Buffer.from(SCANNED_PDF, "latin1").toString("base64");
+    const res = await postJob(env, ctx, { pdfBase64: b64 });
+    assert.equal(res.status, 201);
+    const created = await res.json();
+    await pollUntilDone(env, created.jobId);
+    const { body } = await getJob(env, created.jobId);
+    assert.equal(body.status, "done");
+    assert.equal(body.pdf_scanned, true);
+    assert.equal(body.pdf_note, SCANNED_PDF_REASON);
+    assert.equal(body.report.citation_flags.status, "skipped_scanned_pdf");
+    assert.ok(body.report.limitations.includes(SCANNED_PDF_REASON));
+    for (const d of body.report.dimensions) assert.deepEqual(d.items, [], `${d.dimension} unscored`);
+    const evRes = await worker.fetch(new Request(`https://worker.test/jobs/${created.jobId}/events`), env, {});
+    const evBody = await evRes.json();
+    for (const stage of ["reader", "citation_matcher", "gap", "journal", "supervisor"]) {
+      assert.ok(evBody.events.some((e) => e.stage === stage && e.status === "skipped" && e.detail === SCANNED_PDF_REASON), `${stage} skipped with reason`);
+    }
+    assert.ok(evBody.events.some((e) => e.stage === "reference_verifier" && e.status === "done"));
+    assert.ok(evBody.events.some((e) => e.stage === "job" && e.status === "done"));
+  } finally { globalThis.fetch = orig; }
+});
+
+test("PDF: encrypted PDFs are detected (classic trailer, xref-stream, direct dict) and rejected explicitly", async () => {
+  const { extractTextFromPdf, isEncryptedPdf } = await import("../src/pdf.mjs");
+  const toBuf = (s) => Buffer.from(s, "latin1");
+  // Classic xref: /Encrypt as an indirect reference in the trailer dict.
+  const classic = toBuf("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R /Encrypt 5 0 R >>\nstartxref\n100\n%%EOF\n");
+  assert.equal(isEncryptedPdf(classic), true);
+  assert.throws(() => extractTextFromPdf(classic), (e) => e.code === "PDF_ENCRYPTED" && e.message === "PDF terenkripsi, tidak bisa dibuka");
+  // XRef-stream PDF (PDF 1.5+): no "trailer" keyword, /Encrypt in the
+  // dict of the last object before startxref.
+  const xref = toBuf("%PDF-1.5\n5 0 obj\n<< /Type /XRef /Size 6 /Encrypt 9 0 R /W [1 2 1] >>\nstream\n....\nendstream\nendobj\nstartxref\n200\n%%EOF\n");
+  assert.equal(isEncryptedPdf(xref), true);
+  assert.throws(() => extractTextFromPdf(xref), (e) => e.code === "PDF_ENCRYPTED" && e.message === "PDF terenkripsi, tidak bisa dibuka");
+  // Direct encryption dictionary in the trailer.
+  const direct = toBuf("%PDF-1.4\ntrailer\n<< /Size 1 /Encrypt << /Filter /Standard /V 1 /R 2 >> >>\nstartxref\n50\n%%EOF\n");
+  assert.equal(isEncryptedPdf(direct), true);
+  assert.throws(() => extractTextFromPdf(direct), (e) => e.code === "PDF_ENCRYPTED");
+  // Plain PDF with a text stream: not flagged, text extracted.
+  const plain = toBuf("%PDF-1.4\n1 0 obj\n<< /Length 44 >>\nstream\nBT /F1 12 Tf (Hello world) Tj ET\nendstream\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n150\n%%EOF\n");
+  assert.equal(isEncryptedPdf(plain), false);
+  assert.ok(extractTextFromPdf(plain).includes("Hello world"));
+  // Prose mentioning encryption, but no trailer /Encrypt key: not flagged.
+  const prose = toBuf("%PDF-1.4\n1 0 obj\n<< /Length 60 >>\nstream\nBT /F1 12 Tf (Encryption keeps documents safe) Tj ET\nendstream\nendobj\ntrailer\n<< /Size 2 >>\nstartxref\n150\n%%EOF\n");
+  assert.equal(isEncryptedPdf(prose), false);
+  assert.ok(extractTextFromPdf(prose).includes("Encryption keeps documents safe"));
+});
+
+test("Reader: encrypted PDF job is skipped with the explicit reason and unscored dimensions", async () => {
+  const { runStage } = await import("../src/index.mjs");
+  const { mapDiagnosticToDimensions } = await import("../src/dimensions.mjs");
+  const env = makeEnv("");
+  const job = { id: "t-enc", status: "running", events: [], references: [], partial: false, pdf_encrypted: true };
+  await runStage(env, job, "reader", "", {});
+  assert.equal(job.events[0].stage, "reader");
+  assert.equal(job.events[0].status, "skipped");
+  assert.equal(job.events[0].detail, "PDF terenkripsi, tidak bisa dibuka");
+  assert.equal(job.citation_status, "skipped_encrypted");
+  assert.ok(job.citation_note.includes("PDF terenkripsi, tidak bisa dibuka"));
+  assert.equal(job.partial, true);
+  // Matcher preserves the encrypted status (not "missing list").
+  await runStage(env, job, "citation_matcher", null, {});
+  assert.equal(job.citation_status, "skipped_encrypted");
+  assert.equal(job.result.status, "skipped_encrypted");
+  assert.deepEqual(job.result.missing, []);
+  // Dimensions: References carries the reason and is unscored; every
+  // dimension is empty with an explicit not-scored note, nothing invented.
+  const dims = mapDiagnosticToDimensions(job);
+  assert.equal(dims.length, 5);
+  assert.ok(dims.every((d) => d.count === 0));
+  const refs = dims.find((d) => d.dimension === "References");
+  assert.ok(refs.note.includes("PDF terenkripsi, tidak bisa dibuka"));
+  assert.ok(refs.note.includes("tidak dinilai"));
+  assert.ok(dims.every((d) => typeof d.note === "string" && d.note.length > 0));
+});
+
+test("POST: encrypted PDF upload records the explicit reason on the job", async () => {
+  const env = makeEnv("");
+  const ctx = makeCtx();
+  const pdf = "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Size 2 /Root 1 0 R /Encrypt 5 0 R >>\nstartxref\n100\n%%EOF\n";
+  const res = await postJob(env, ctx, { pdfBase64: Buffer.from(pdf, "latin1").toString("base64") });
+  assert.equal(res.status, 201);
+  const created = await res.json();
+  const { body } = await getJob(env, created.jobId);
+  assert.equal(body.pdf_note, "PDF terenkripsi, tidak bisa dibuka");
+  assert.equal(body.pdf_encrypted, true);
+  const readerEvent = body.events.find((e) => e.stage === "reader");
+  assert.equal(readerEvent.status, "skipped");
+  assert.equal(readerEvent.detail, "PDF terenkripsi, tidak bisa dibuka");
+  assert.equal(body.citation_status, "skipped_encrypted");
+});
+
+test("Parser: footnote references (numbered APA) parse to author-year keys, body excised", async () => {
+  const { parseReferences, scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchAuthorYearKeys } = await import("../src/citation-matcher.mjs");
+  const text = [
+    "Introduction. Prior work shows the effect (Smith, 2020) and its limits (Jones, 2019).",
+    "1. Smith, J. (2020). The effect of checklists on farm outcomes. Journal of Agricultural Work, 12(3), 45-67.",
+    "Discussion. The missing study (Rahman, 2021) is not in the footnotes.",
+    "2. Jones, A. (2019). Limits of checklist adoption. Farming Studies, 3, 10-20.",
+    "3. Lee, K. (2018). An older uncited work. Rural Research, 7, 88-99.",
+  ].join("\n");
+  const p = parseReferences(text);
+  assert.equal(p.status, "parsed");
+  assert.equal(p.style, "footnote");
+  assert.deepEqual(p.keys, ["smith, 2020", "jones, 2019", "lee, 2018"]);
+  assert.ok(!p.body.includes("The effect of checklists"), "footnote lines must be excised from the body");
+  assert.ok(p.body.includes("Prior work shows"));
+  const res = matchAuthorYearKeys(scanAuthorYearCitations(p.body), p.keys);
+  assert.deepEqual(res.missing, ["rahman, 2021"]);
+  assert.deepEqual(res.uncited, ["lee, 2018"]);
+  assert.deepEqual(res.duplicates, []);
+});
+
+test("Parser: footnote references (Chicago note, plain, symbol and superscript markers)", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = [
+    "The argument builds on Smith and on Davis.",
+    "1. John Smith, The Wealth of Things (New York: Norton, 2020).",
+    "† Davis, 1989. Perceived usefulness and ease of use in farm systems.",
+    "² Lee, K. (2018). An older work with a wrapped title. Rural Research, 7, 88-99.",
+  ].join("\n");
+  const p = parseReferences(text);
+  assert.equal(p.status, "parsed");
+  assert.equal(p.style, "footnote");
+  assert.deepEqual(p.keys, ["smith, 2020", "davis, 1989", "lee, 2018"]);
+});
+
+test("Parser: footnote repeats deduped, counted, not duplicates", async () => {
+  const { parseReferences, scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchAuthorYearKeys } = await import("../src/citation-matcher.mjs");
+  const text = [
+    "Work cites (Smith, 2020).",
+    "1. Smith, J. (2020). The effect of checklists. Journal A, 12, 45-67.",
+    "2. Smith, J. (2020). The effect of checklists. Journal A, 12, 45-67.",
+    "3. Jones, A. (2019). Limits of adoption. Farming Studies, 3, 10-20.",
+  ].join("\n");
+  const p = parseReferences(text);
+  assert.equal(p.style, "footnote");
+  assert.deepEqual(p.keys, ["smith, 2020", "jones, 2019"]);
+  assert.equal(p.footnote_repeats, 1);
+  const res = matchAuthorYearKeys(scanAuthorYearCitations(p.body), p.keys);
+  assert.deepEqual(res.duplicates, []);
+  assert.deepEqual(res.uncited, ["jones, 2019"]);
+});
+
+test("Parser: body sentences are not footnote entries (comma-year guard, <2 gate, ibid skipped)", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  // Comma-year body prose: no period after the year -> no match.
+  const prose = "Smith, 2020, argues that checklists help. Jones, 2019, shows limits. No reference list here.";
+  assert.equal(parseReferences(prose).status, "no_references");
+  // A single reference-shaped line is below the >=2 gate.
+  const single = "Body text.\n1. Smith, J. (2020). The effect of checklists. Journal A, 12, 45-67.\nMore body.";
+  assert.equal(parseReferences(single).status, "no_references");
+  // Ibid lines never become entries (ibid resolution is a separate task).
+  const ibid = "Body (Smith, 2020).\n1. Smith, J. (2020). The effect of checklists. Journal A, 12, 45-67.\n2. Ibid., p. 50.\n3. Jones, A. (2019). Limits of adoption. Farming Studies, 3, 10-20.";
+  const p = parseReferences(ibid);
+  assert.equal(p.style, "footnote");
+  assert.deepEqual(p.keys, ["smith, 2020", "jones, 2019"]);
+});
+
+test("Parser: tail bibliography still wins over footnote lines", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = [
+    "Body cites [1] and [2].",
+    "1. Smith, J. (2020). A footnote-shaped line in the body. Journal A, 12, 45-67.",
+    "References",
+    "1. Bogue, R. Robotic exoskeletons.",
+    "2. Inoue, Y. Wrist exoskeleton.",
+  ].join("\n");
+  const p = parseReferences(text);
+  assert.equal(p.style, "numeric");
+  assert.deepEqual(p.keys, ["1", "2"]);
+});
+
+test("Job: footnote references match in footnote mode, no key", async () => {
+  const orig = installFakeFetch();
+  try {
+    const env = makeEnv("");
+    const ctx = makeCtx();
+    const text = [
+      "Introduction. Prior work shows the effect (Smith, 2020) and its limits (Jones, 2019).",
+      "1. Smith, J. (2020). The effect of checklists on farm outcomes. Journal of Agricultural Work, 12(3), 45-67.",
+      "Discussion. The missing study (Rahman, 2021) is not in the footnotes.",
+      "2. Jones, A. (2019). Limits of checklist adoption. Farming Studies, 3, 10-20.",
+      "3. Lee, K. (2018). An older uncited work. Rural Research, 7, 88-99.",
+    ].join("\n");
+    const res = await postJob(env, ctx, { text });
+    const created = await res.json();
+    await pollUntilDone(env, created.jobId);
+    const { body } = await getJob(env, created.jobId);
+    assert.equal(body.result.status, "done");
+    assert.equal(body.result.mode, "footnote");
+    assert.deepEqual(body.result.missing, ["rahman, 2021"]);
+    assert.deepEqual(body.result.uncited, ["lee, 2018"]);
+    assert.equal(body.report.citation_flags.reference_style, "footnote");
+  } finally { globalThis.fetch = orig; }
+});
+
+test("Parser: multilingual reference headings — Indonesian Daftar Pustaka", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = "Penelitian ini mengutip [1] dan [2].\n\nDaftar Pustaka\n1. Wijaya, A. Irigasi hemat air.\n2. Santoso, B. Pupuk organik.\n3. Pratama, C. Panen padi.";
+  const p = parseReferences(text);
+  assert.equal(p.status, "parsed");
+  assert.equal(p.style, "numeric");
+  assert.deepEqual(p.keys, ["1", "2", "3"]);
+  assert.ok(!p.body.includes("Wijaya"));
+});
+
+test("Parser: multilingual reference headings — Spanish Referencias", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = "El estudio cita [1] y [2].\n\nReferencias\n1. García, M. Riego eficiente.\n2. López, J. Fertilizantes.\n3. Martínez, A. Cosecha.";
+  const p = parseReferences(text);
+  assert.equal(p.status, "parsed");
+  assert.equal(p.style, "numeric");
+  assert.deepEqual(p.keys, ["1", "2", "3"]);
+  assert.ok(!p.body.includes("García"));
+});
+
+test("Parser: multilingual reference headings — French Bibliographie (author-year)", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = "Cette étude cite (Dupont, 2019) et (Martin, 2021).\n\nBibliographie\n- Dupont, 2019. Irrigation efficace.\n- Martin, 2021. Engrais verts.\n- Bernard, 2018. Récolte du blé.";
+  const p = parseReferences(text);
+  assert.equal(p.status, "parsed");
+  assert.equal(p.style, "author-year");
+  assert.deepEqual(p.keys, ["dupont, 2019", "martin, 2021", "bernard, 2018"]);
+  assert.ok(!p.body.includes("Irrigation efficace"));
+});
+
+test("Parser: multilingual reference headings — German Literaturverzeichnis", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = "Die Studie zitiert [1] und [2].\n\nLiteraturverzeichnis\n1. Müller, H. Effiziente Bewässerung.\n2. Schmidt, K. Düngemittel.\n3. Weber, F. Ernte.";
+  const p = parseReferences(text);
+  assert.equal(p.status, "parsed");
+  assert.equal(p.style, "numeric");
+  assert.deepEqual(p.keys, ["1", "2", "3"]);
+  assert.ok(!p.body.includes("Müller"));
+});
+
+test("Parser: multilingual reference headings — Dutch Referenties (author-year)", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = "Deze studie citeert (Jansen, 2020) en (De Vries, 2022).\n\nReferenties\n- Jansen, 2020. Efficiënte irrigatie.\n- De Vries, 2022. Groene meststoffen.\n- Bakker, 2019. Tarweoogst.";
+  const p = parseReferences(text);
+  assert.equal(p.status, "parsed");
+  assert.equal(p.style, "author-year");
+  assert.deepEqual(p.keys, ["jansen, 2020", "de vries, 2022", "bakker, 2019"]);
+  assert.ok(!p.body.includes("Efficiënte irrigatie"));
+});
+
+test("Parser: multilingual reference headings — further variants parse identically", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const variants = [
+    ["Daftar Referensi", "1. Wijaya, A. Irigasi.\n2. Santoso, B. Pupuk."],
+    ["Références", "1. Dupont, P. Irrigation.\n2. Martin, L. Engrais."],
+    ["Bibliografía", "1. García, M. Riego.\n2. López, J. Fertilizantes."],
+    ["Literatuurlijst", "1. Jansen, P. Irrigatie.\n2. Bakker, K. Meststoffen."],
+    ["Referências", "1. Silva, A. Irrigação.\n2. Santos, B. Fertilizantes."],
+    ["Bibliografia", "1. Rossi, M. Irrigazione.\n2. Bianchi, L. Fertilizzanti."],
+  ];
+  for (const [heading, list] of variants) {
+    const p = parseReferences(`Body cites [1].\n\n${heading}\n${list}`);
+    assert.equal(p.status, "parsed", heading);
+    assert.equal(p.style, "numeric", heading);
+    assert.deepEqual(p.keys, ["1", "2"], heading);
+  }
+});
+
+test("Parser: multilingual heading — body mention does not hijack the zone", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = "Lihat Daftar Pustaka di akhir naskah untuk detail.\n\nDaftar Pustaka\n1. Wijaya, A. Irigasi hemat air.\n2. Santoso, B. Pupuk organik.";
+  const p = parseReferences(text);
+  assert.equal(p.status, "parsed");
+  assert.deepEqual(p.keys, ["1", "2"]);
+  assert.ok(p.body.includes("Lihat Daftar Pustaka"));
+});
+
+test("Parser: splitMarkedBody honours a non-English heading", async () => {
+  const { splitMarkedBody } = await import("../src/reference-parser.mjs");
+  const marked = "Body cites \u00011\u0002.\n\nDaftar Pustaka\n1. Wijaya, A. Irigasi.\n2. Santoso, B. Pupuk.";
+  const body = splitMarkedBody(marked);
+  assert.ok(body.includes("Body cites"));
+  assert.ok(!body.includes("Wijaya"));
+});
+
+test("Scanner: author-year citations in tables and captions count once, table-only citations found", async () => {
+  const { parseReferences, scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchAuthorYearKeys } = await import("../src/citation-matcher.mjs");
+  const doc = `Introduction. Prior work shows strong effects (Davis, 1989).
+Table 1. Summary of studies.
+Study | Year | Effect
+Davis, 1989 | 1989 | 0.42
+Venkatesh, 2003 | 2003 | 0.51
+Figure 1. Model adapted from Venkatesh, 2003 and Davis, 1989.
+Table 2. Studies not in the prose: Patel, 2019.
+References
+- Davis, 1989. Perceived usefulness.
+- Venkatesh, 2003. User acceptance.
+- Patel, 2019. Later work.
+- Wijaya, 2017. Uncited work.`;
+  const p = parseReferences(doc);
+  const cited = scanAuthorYearCitations(p.body);
+  // Davis appears in prose, table and caption but counts once; Patel
+  // appears only in a table and must still be found.
+  assert.deepEqual([...cited].sort(), ["davis, 1989", "patel, 2019", "venkatesh, 2003"]);
+  const m = matchAuthorYearKeys(cited, p.keys);
+  assert.deepEqual(m.missing, []);
+  assert.deepEqual(m.uncited, ["wijaya, 2017"]);
+});
+
+test("Scanner: numeric table citations are order-independent (row-wise vs column-first)", async () => {
+  const { parseReferences, scanBracketCitations } = await import("../src/reference-parser.mjs");
+  const { matchCitations } = await import("../src/citation-matcher.mjs");
+  const refs = `References
+1. Alpha, A. First system.
+2. Beta, B. Second system.
+3. Gamma, C. Third system.`;
+  const rowWise = `Introduction. Earlier systems [1] improved recall.
+Table 1. Comparison.
+Alpha | 0.91 | [1]
+Beta | 0.88 | [2, 3]
+Figure 1. Architecture from [2].
+${refs}`;
+  const columnFirst = `Introduction. Earlier systems [1] improved recall.
+Table 1. Comparison.
+Alpha
+Beta
+0.91
+0.88
+[1]
+[2, 3]
+Figure 1. Architecture from [2].
+${refs}`;
+  const a = parseReferences(rowWise), b = parseReferences(columnFirst);
+  const ca = scanBracketCitations(a.body), cb = scanBracketCitations(b.body);
+  assert.deepEqual([...ca].sort(), [...cb].sort());
+  assert.deepEqual([...ca].sort(), ["1", "2", "3"]);
+  const m = matchCitations(ca, a.keys);
+  assert.deepEqual(m.missing, []);
+  assert.deepEqual(m.uncited, []);
+});
+
+test("Scanner: caption enumerating two sources keeps the second citation (not a second author)", async () => {
+  const { scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const body = "Figure 1. Model adapted from Davis, 1989 and Venkatesh, 2003. Table 3. Sources: Patel (2020) and Smith (2021) compared. Two-author control (Serra & Kunc, 2015).";
+  const keys = scanAuthorYearCitations(body);
+  assert.deepEqual([...keys].sort(), ["davis, 1989", "patel, 2020", "serra, 2015", "smith, 2021", "venkatesh, 2003"]);
+});
+
+test("Scanner: narrow-cell wraps inside tables (et/al split, year on next line in parens)", async () => {
+  const { scanAuthorYearCitations, scanAuthorYearCitationContexts } = await import("../src/reference-parser.mjs");
+  const body = "Table 1. Narrow cells: Davis et\n al., 1989; source Davis et al. (\n2020); two-author Serra and Kunc (\n2015).";
+  const keys = scanAuthorYearCitations(body);
+  assert.deepEqual([...keys].sort(), ["davis, 1989", "davis, 2020", "serra, 2015"]);
+  // Contexts must stay in sync with the scan (same keys, same patterns).
+  const ctx = scanAuthorYearCitationContexts(body);
+  assert.deepEqual(ctx.map((c) => c.key).sort(), [...keys].sort());
+});
+
+test("Matcher: table data bracket range beyond the list is flagged truncated, not proven missing", async () => {
+  const { runStage } = await import("../src/index.mjs");
+  const env = makeEnv("");
+  const refs = ["1. Alpha, A. First system.", "2. Beta, B. Second system.", "3. Gamma, C. Third system."];
+  const job = { id: "t-test", status: "running", events: [], references: refs, reference_keys: ["1", "2", "3"], reference_style: "numeric", scanned_citations: { bracket: ["1", "2", "12", "13", "14", "15"], author_year: [], superscript: [] }, citation_contexts: [] };
+  await runStage(env, job, "citation_matcher", null, {});
+  assert.equal(job.result.list_truncated, true);
+  assert.ok(job.result.list_note.includes("[15]"));
+});
+
+test("Extractor: PDF table emitted row-wise vs column-first gives identical citation counts", async () => {
+  const { extractTextFromPdf } = await import("../src/pdf.mjs");
+  const { parseReferences, stripMarkerChars, scanBracketCitations, scanSuperscriptCitations, splitMarkedBody } = await import("../src/reference-parser.mjs");
+  const { matchCitations } = await import("../src/citation-matcher.mjs");
+  const esc = (s) => s.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+  const tj = (s) => `BT /F1 10 Tf (${esc(s)}) Tj ET`;
+  const pdf = (runs) => `%PDF-1.4\n1 0 obj\n<< /Length 0 >>\nstream\n${runs.join("\n")}\nendstream\nendobj\n%%EOF\n`;
+  const tail = [tj("Figure 1. Architecture from [2]."), tj("References"), tj("1. Alpha, A. First system."), tj("2. Beta, B. Second system."), tj("3. Gamma, C. Third system.")];
+  const rowWise = pdf([tj("Introduction. Earlier systems [1] improved recall."), tj("Alpha"), tj("0.91"), tj("[1]"), tj("Beta"), tj("0.88"), tj("[2, 3]"), ...tail]);
+  const columnFirst = pdf([tj("Introduction. Earlier systems [1] improved recall."), tj("Alpha"), tj("Beta"), tj("0.91"), tj("0.88"), tj("[1]"), tj("[2, 3]"), ...tail]);
+  const check = (doc) => {
+    const text = extractTextFromPdf(Buffer.from(doc));
+    const p = parseReferences(stripMarkerChars(text));
+    return matchCitations(scanBracketCitations(p.body), p.keys);
+  };
+  const a = check(rowWise), b = check(columnFirst);
+  assert.deepEqual(a, b);
+  assert.deepEqual(a.missing, []);
+  assert.deepEqual(a.uncited, []);
+  // A Ts-raised digit inside a table cell is a marked superscript citation.
+  const sup = pdf([tj("Body paragraph text here with enough length to count as a body line for size detection."), "BT /F1 10 Tf 0 5 Ts (7) Tj ET", tj("References"), tj("1. One, A. First."), tj("2. Two, B. Second."), tj("3. Three, C. Third."), tj("4. Four, D. Fourth."), tj("5. Five, E. Fifth."), tj("6. Six, F. Sixth."), tj("7. Seven, G. Seventh.")]);
+  const supText = extractTextFromPdf(Buffer.from(sup));
+  assert.deepEqual(scanSuperscriptCitations(splitMarkedBody(supText)), ["7"]);
+});
+
+// --- Task 6/12: ibid / op. cit. resolution ---
+test("Ibid: author-year list chain resolves to previous author, matcher uses resolved keys", async () => {
+  const { parseReferences, scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchAuthorYearKeys } = await import("../src/citation-matcher.mjs");
+  const text = [
+    "Smith (2020) introduced the method. Smith (2021) extended it to new data.",
+    "References",
+    "Smith, J. (2020). The original method. Journal of Examples 1, 1-9.",
+    "Ibid. (2021). The extension. Journal of Examples 2, 10-19.",
+  ].join("\n");
+  const p = parseReferences(text);
+  assert.equal(p.status, "parsed");
+  assert.deepEqual(p.keys, ["smith, 2020", "smith, 2021"]);
+  const res = matchAuthorYearKeys(scanAuthorYearCitations(p.body), p.keys);
+  assert.deepEqual(res.missing, []);
+  assert.deepEqual(res.uncited, []);
+});
+
+test("Ibid: three-chain + idem + dash-repeat all resolve, body cites all four", async () => {
+  const { parseReferences, scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchAuthorYearKeys } = await import("../src/citation-matcher.mjs");
+  const text = [
+    "Smith (2020), Smith (2021), Smith (2022), Smith (2023) form the series.",
+    "References",
+    "Smith, J. (2020). Part one.",
+    "Ibid. (2021). Part two.",
+    "Idem (2022). Part three.",
+    "——. (2023). Part four.",
+  ].join("\n");
+  const p = parseReferences(text);
+  assert.deepEqual(p.keys, ["smith, 2020", "smith, 2021", "smith, 2022", "smith, 2023"]);
+  const res = matchAuthorYearKeys(scanAuthorYearCitations(p.body), p.keys);
+  assert.deepEqual(res.missing, []);
+  assert.deepEqual(res.uncited, []);
+});
+
+test("Ibid: leading ibid with no previous entry stays unresolvable, honestly uncited", async () => {
+  const { parseReferences, scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchAuthorYearKeys } = await import("../src/citation-matcher.mjs");
+  const text = [
+    "Smith (2021) is the only work cited.",
+    "References",
+    "Ibid. (2020). An orphan work with no earlier entry.",
+    "Smith, J. (2021). The cited work.",
+  ].join("\n");
+  const p = parseReferences(text);
+  assert.deepEqual(p.keys, ["ibid, 2020", "smith, 2021"]);
+  const res = matchAuthorYearKeys(scanAuthorYearCitations(p.body), p.keys);
+  assert.deepEqual(res.missing, []);
+  assert.deepEqual(res.uncited, ["ibid, 2020"]);
+});
+
+test("Ibid: resolveIbidKeys handles chains, op. cit. unique/ambiguous/absent", async () => {
+  const { resolveIbidKeys } = await import("../src/citation-matcher.mjs");
+  assert.deepEqual(resolveIbidKeys(["smith, 2020", "ibid, 2021"]), ["smith, 2020", "smith, 2021"]);
+  assert.deepEqual(resolveIbidKeys(["smith, 2020", "ibidem, 2021", "idem, 2022"]), ["smith, 2020", "smith, 2021", "smith, 2022"]);
+  // Unique prior same-surname op. cit. resolves to that key (duplicate).
+  assert.deepEqual(resolveIbidKeys(["smith, 2020", "smith, op. cit."]), ["smith, 2020", "smith, 2020"]);
+  // Ambiguous (two Smith works) and absent (no Jones work) stay literal.
+  assert.deepEqual(resolveIbidKeys(["smith, 2020", "smith, 2019", "smith, op. cit."]), ["smith, 2020", "smith, 2019", "smith, op. cit."]);
+  assert.deepEqual(resolveIbidKeys(["smith, 2020", "jones, op. cit."]), ["smith, 2020", "jones, op. cit."]);
+  // Idempotent on already-resolved keys.
+  assert.deepEqual(resolveIbidKeys(["smith, 2020", "smith, 2021"]), ["smith, 2020", "smith, 2021"]);
+});
+
+test("Ibid: list op. cit. entry with unique prior resolves to duplicate via matcher", async () => {
+  const { parseReferences, scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchAuthorYearKeys } = await import("../src/citation-matcher.mjs");
+  const text = [
+    "Smith (2020) is cited.",
+    "References",
+    "Smith, J. (2020). The original work.",
+    "Smith, op. cit.",
+  ].join("\n");
+  const p = parseReferences(text);
+  assert.deepEqual(p.keys, ["smith, 2020", "smith, 2020"]);
+  const res = matchAuthorYearKeys(scanAuthorYearCitations(p.body), p.keys);
+  assert.deepEqual(res.missing, []);
+  assert.deepEqual(res.uncited, []);
+  assert.deepEqual(res.duplicates, ["smith, 2020"]);
+});
+
+test("Ibid: body op. cit. matches unique listed work; satisfied when full citation exists", async () => {
+  const { scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchAuthorYearKeys } = await import("../src/citation-matcher.mjs");
+  // Body cites Smith ONLY via op. cit. -> claims the unique Smith entry.
+  const citedOnly = scanAuthorYearCitations("As shown by Smith, op. cit., the effect holds.");
+  assert.ok(citedOnly.includes("smith, op. cit."));
+  const resOnly = matchAuthorYearKeys(citedOnly, ["smith, 2020"]);
+  assert.deepEqual(resOnly.missing, []);
+  assert.deepEqual(resOnly.uncited, []);
+  // Body cites Smith (2020) fully AND via op. cit. -> no false missing.
+  const citedBoth = scanAuthorYearCitations("Smith (2020) showed it. Smith, op. cit., confirms it.");
+  const resBoth = matchAuthorYearKeys(citedBoth, ["smith, 2020", "jones, 2019"]);
+  assert.deepEqual(resBoth.missing, []);
+  assert.deepEqual(resBoth.uncited, ["jones, 2019"]);
+  // Ambiguous body op. cit. (two Smith works, none cited fully) stays flagged.
+  const resAmb = matchAuthorYearKeys(["smith, op. cit."], ["smith, 2020", "smith, 2019"]);
+  assert.deepEqual(resAmb.missing, ["smith, op. cit."]);
+  assert.equal(resAmb.ambiguous.length, 1);
+});
+
+test("Ibid: numeric list ibid entry text does not break number matching", async () => {
+  const { parseReferences, scanBracketCitations } = await import("../src/reference-parser.mjs");
+  const { matchCitations } = await import("../src/citation-matcher.mjs");
+  const text = [
+    "Prior work [1] and the follow-up [2] agree.",
+    "References",
+    "1. Smith, J. The original work.",
+    "2. Ibid. The follow-up work.",
+  ].join("\n");
+  const p = parseReferences(text);
+  assert.equal(p.style, "numeric");
+  assert.deepEqual(p.keys, ["1", "2"]);
+  const res = matchCitations(scanBracketCitations(p.body), p.keys);
+  assert.deepEqual(res.missing, []);
+  assert.deepEqual(res.uncited, []);
+});
+
+test("Parser (313): PeerJ author-year list — same-line, year-next-line, hyphen-wrap, footer skip", async () => {
+  const { parseReferences, scanAuthorYearCitations } = await import("../src/reference-parser.mjs");
+  const { matchAuthorYearKeys } = await import("../src/citation-matcher.mjs");
+  // Body cites Hammer via an "and"-joined pair and the paper's own
+  // footer text; the zone carries a page footer mid-list.
+  const text = "Work cites (Woolf et al., 2010) and (Abed, 2022) and (Boldt-Burisch et al., 2023) and Solaiman et al. (2010) and Hammer et al. (2015) and (Kilowasid et al., 2023) and (Neuberger et al., 2024) and (Shirzad et al., 2024).\n\nREFERENCES\nAbed R. 2022. Effect of biochar in arbuscular mycorrhiza fungi.\nJournal of University of Anbar for Pure Science 12:19-27.\nBoldt-Burisch K, Dhar A, Robinson M, Naeth MA. 2023. Soil amendments impact root-associated fungal communities.\nRestoration Ecology 31:e13930.\nSetyawan et al. (2026),\nPeerJ\n, DOI\n10.7717/peerj.21336\n16/22\nHammer E, Forstreuter M, Rillig M, Kohler J. 2015. Biochar increases arbuscular mycorrhizal plant growth enhancement.\nApplied Soil Ecology 96:114-121.\nKilowasid LMH, Manik DS, Nevianti N, Afa LO, Rakian TC, Hisein WSA, Sadiman-\ntara GR, Sarawa S, Halim H. 2023. Effect of biochar on arbuscular mycorrhizae fungi.\nIOP Conference Series: Earth and Environmental Science 1162:012006.\nNeuberger P, Romero C, Kim K, Hao X, McAllister TA, Ngo S, Li C, Gorzelak MA.\n2024. Biochar is colonized by select arbuscular mycorrhizal fungi in agricultural soils.\nMycorrhiza 34:191-201.\nShirzad H, Moghaddam SS, Rahimi A, Rezapour S, Xiao J, Popovi¢-Djordjevi¢ J.\n2024. Combined effect of biological and organic fertilizers.\nAgronomy 14:1024.\nSolaiman Z, Blackwell P, Abbott L, Storer P. 2010. Direct and residual effect of biochar application on mycorrhizal root colonisation.\nSoil Research 48:546.\nWoolf D, Amonette J, Street-Perrott F, Lehmann J, Joseph S. 2010. Sustainable biochar to mitigate global climate change.\nNature Communications 1:1-9.";
+  const p = parseReferences(text);
+  assert.equal(p.style, "author-year");
+  assert.deepEqual(p.keys, ["abed, 2022", "boldt-burisch, 2023", "hammer, 2015", "kilowasid, 2023", "neuberger, 2024", "shirzad, 2024", "solaiman, 2010", "woolf, 2010"]);
+  const res = matchAuthorYearKeys(scanAuthorYearCitations(p.body), p.keys);
+  assert.deepEqual(res.missing, []);
+  assert.deepEqual(res.uncited, []);
+});
+
+test("Parser (313): table column headed References must not hijack the true list", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = "Treatment Crop Soil properties Crop yield References\nBiochar-Only Wheat Improved soil pH\nHerawati et al., 2021\nSome table row\n\nREFERENCES\nAbed R. 2022. Effect of biochar in arbuscular mycorrhiza fungi.\nJournal of University of Anbar for Pure Science 12:19-27.\nWoolf D, Amonette J, Street-Perrott F, Lehmann J, Joseph S. 2010. Sustainable biochar to mitigate global climate change.\nNature Communications 1:1-9.";
+  const p = parseReferences(text);
+  assert.deepEqual(p.keys, ["abed, 2022", "woolf, 2010"]);
+  assert.ok(!p.keys.includes("herawati et al., 2021"));
+});
+
+test("Parser (313): PeerJ initials — 3-letter, hyphenated, accented", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = "Body.\n\nREFERENCES\nBarna G, Makó A, Takács T, Skic K, Füzy A, Horel Á. 2020. Biochar alters soil physical characteristics.\nAgronomy 10:1933.\nMason ARG, Bicharanloo B, Salomon M, Lowe A, Dijkstra FA, Cavagnaro T. 2025. Enhanced stabilisation of soil carbon.\nSoil Biology and Biochemistry 45:12-20.\nShoudho KN, Khan TH, Ara UR, Khan MR, Shawon ZBZ, Hoque ME. 2024. Biochar in global carbon cycle.\nScience of the Total Environment 900:165432.\nWen Z-H, Chen Y-X, Shi Y-J, Zhu X-L, Liu S-N, Meng J. 2024. Combined application of biochar and arbuscular mycorrhizal fungi.\nPlant and Soil 500:100-110.";
+  const p = parseReferences(text);
+  assert.deepEqual(p.keys, ["barna, 2020", "mason, 2025", "shoudho, 2024", "wen, 2024"]);
+});
+
+test("Parser (313): wrapped author lists without hyphen or period", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = "Body.\n\nREFERENCES\nHerawati A, Syamsiyah J, Mujiyo M, Rochmadtulloh M, Susila A, Romadhon\nM. 2021. Mycorrhizae and a soil ameliorant on improving characteristics.\nSoil Science 10:1-9.\nJabborova D, Annapurna K, Azimov A, Tyagi S, Pengani KR, Sharma P, Vikram\nKV, Poczai P, Nasif O, Ansari MJ, Sayyed RZ. 2022. Co-inoculation of biochar.\nPlant and Soil 470:50-60.\nSopandi TP, Sulianto AA, Anugroho F, Yusoff MZM, Mohamed MS, Farid MAA,\nSetyawan HY. 2025. RSM-optimized biochar production from young coconut waste.\nIndustrial Crops and Products 223:120157.";
+  const p = parseReferences(text);
+  assert.deepEqual(p.keys, ["herawati, 2021", "jabborova, 2022", "sopandi, 2025"]);
+});
+
+test("Scanner (313): 3-author keys, and-joined pairs, footer, hyphen tail, split et al., mangled names", async () => {
+  const { scanAuthorYearCitations, scanAuthorYearCitationContexts } = await import("../src/reference-parser.mjs");
+  const body = "Work cites (Meng, Cheng & Li, 2024) and (Asadabadi, Hage-Ahmed & Steinkellner (2021)) and Solaiman et al. (2010) and Hammer et al. (2015) and (Bednik, Medynska-Juraszek & Cwielag-Piasecka, 2022). Footer: Setyawan et al. (2026), PeerJ , DOI 10.7717/peerj.21336 16/22. Split: (Sousa et\n al., 2024). Mangled: ( Fi²arová et al., 2024 ). Two-author control: (Serra & Kunc, 2015).";
+  const cited = scanAuthorYearCitations(body);
+  assert.deepEqual(cited, ["sousa, 2024", "fi²arová, 2024", "solaiman, 2010", "hammer, 2015", "serra, 2015", "meng, 2024", "bednik, 2022", "asadabadi, 2021"]);
+  // Context keys must match the scan exactly.
+  const ctxKeys = scanAuthorYearCitationContexts(body).map((c) => c.key);
+  assert.deepEqual(ctxKeys, cited);
+});
+
+test("Parser (313): mangled first surname still parses (key keeps the mangled form)", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = "Body cites (Fi²arová et al., 2024).\n\nREFERENCES\nFi²arová L, Berchová K, Luká£ M, Beesley L, Vosátka M, Hausenblas M, Trakal L. 2024. Biochar effects on soil.\nGCB Bioenergy 13:708-718.\nAbed R. 2022. Effect of biochar in arbuscular mycorrhiza fungi.\nJournal of University of Anbar for Pure Science 12:19-27.";
+  const p = parseReferences(text);
+  assert.deepEqual(p.keys, ["fi²arová, 2024", "abed, 2022"]);
+});
+
+test("Parser (335): bare journal line PLoS ONE must not start a PeerJ-wrap entry", async () => {
+  const { parseReferences } = await import("../src/reference-parser.mjs");
+  const text = "Body cites (Smith, 2019) and (Greyling, 2020).\n\nREFERENCES\nSmith J, Jones K. 2019. Some title about biochar.\nPLoS ONE\n12 (10), e0185815.\nGreyling, T., & Tregenna, F. (2020). Quality of life: Validation of an instrument.\nDevelopment Southern Africa, 37 (1), 19-39.";
+  const p = parseReferences(text);
+  assert.deepEqual(p.keys, ["smith, 2019", "greyling, 2020"]);
+  assert.ok(!p.keys.includes("plos, 2020"));
+});
+
+test("Quota: OpenAlex searches + DOI/title lookups counted per job", async () => {
+  const { searchStrengthening, verifyReference } = await import("../src/strengthening.mjs");
+  const { createQuotaCounter } = await import("../src/quota.mjs");
+  const fetchQ = async (url) => {
+    const u = String(url);
+    if (u.includes("api.crossref.org")) return { ok: true, status: 200, json: async () => ({ message: { title: ["DOI work"], author: [{ family: "D", given: "X" }], published: { "date-parts": [[2020]] }, "container-title": ["J"] } }) };
+    if (u.includes("api.openalex.org")) {
+      if (u.includes("per-page=3")) return { ok: true, status: 200, json: async () => ({ results: [
+        { title: "DOI work", doi: "https://doi.org/10.1234/a", authorships: [], publication_year: 2020, primary_location: { source: { display_name: "J" } } },
+        { title: "No DOI work", doi: null, authorships: [{ author: { display_name: "N" } }], publication_year: 2021, primary_location: { source: { display_name: "K" } } },
+      ] }) };
+      return { ok: true, status: 200, json: async () => ({ results: [{ title: "No DOI work", authorships: [{ author: { display_name: "N" } }], publication_year: 2021, primary_location: { source: { display_name: "K" } }, doi: null }] }) };
+    }
+    throw new Error(`unexpected ${u}`);
+  };
+  const q = createQuotaCounter();
+  const r = await searchStrengthening(["Theory A"], fetchQ, q);
+  assert.equal(q.openalex_searches, 1);
+  assert.equal(q.crossref_doi_lookups, 1);
+  assert.equal(q.openalex_title_lookups, 1);
+  assert.equal(r.recommendations.length, 2);
+  assert.deepEqual(r.recommendations.map((x) => x.verification), ["verified", "candidate"]);
+  assert.equal(r.quota.openalex_calls, 2);
+  const q2 = createQuotaCounter();
+  const v1 = await verifyReference("A, 2020. T. 10.1234/x", fetchQ, q2);
+  const v2 = await verifyReference("A, 2020. Title without DOI.", fetchQ, q2);
+  assert.equal(v1.status, "verified");
+  assert.equal(v2.status, "candidate");
+  assert.equal(q2.crossref_doi_lookups, 1);
+  assert.equal(q2.openalex_title_lookups, 1);
+  // Backward compat: no counter passed -> same results, quota null.
+  const r0 = await searchStrengthening(["Theory A"], fetchQ);
+  assert.equal(r0.recommendations.length, 2);
+  assert.equal(r0.quota, null);
+});
+
+test("Quota: strengthening reserved when budget exhausted, reason recorded, no search spent", async () => {
+  const { runStage } = await import("../src/index.mjs");
+  let searchCalls = 0;
+  const fetchStub = async (url) => {
+    if (String(url).includes("api.openalex.org") && String(url).includes("per-page=3")) searchCalls += 1;
+    return { ok: true, status: 200, json: async () => ({ results: [] }) };
+  };
+  const job = { id: "q1", status: "running", events: [], gap: { missing_theories: [{ name: "Diffusion of Innovations" }], rival_theories: [] }, quota: { openalex_searches: 9, openalex_title_lookups: 0, crossref_doi_lookups: 0 } };
+  await runStage({ OPENALEX_JOB_BUDGET: "10" }, job, "strengthening", null, { fetchImpl: fetchStub });
+  assert.equal(job.strengthening.skipped, true);
+  assert.equal(job.strengthening.reason, "quota_reserved");
+  assert.deepEqual(job.strengthening.recommendations, []);
+  assert.equal(searchCalls, 0);
+  assert.equal(job.strengthening.quota_budget, 10);
+  assert.equal(job.strengthening.quota_estimate, 4);
+  assert.ok(job.events.some((e) => e.stage === "strengthening" && e.status === "skipped"));
+});
+
+test("Quota: strengthening runs when budget fits, counter accumulates", async () => {
+  const { runStage } = await import("../src/index.mjs");
+  const fetchStub = async (url) => {
+    const u = String(url);
+    if (u.includes("api.crossref.org")) return { ok: true, status: 200, json: async () => ({ message: { title: ["DOI work"], author: [{ family: "D", given: "X" }], published: { "date-parts": [[2020]] }, "container-title": ["J"] } }) };
+    return { ok: true, status: 200, json: async () => ({ results: [{ title: "DOI work", doi: "https://doi.org/10.1234/a", authorships: [], publication_year: 2020, primary_location: { source: { display_name: "J" } } }] }) };
+  };
+  const job = { id: "q2", status: "running", events: [], gap: { missing_theories: [{ name: "Diffusion of Innovations" }], rival_theories: [] }, quota: { openalex_searches: 2, openalex_title_lookups: 0, crossref_doi_lookups: 0 } };
+  await runStage({}, job, "strengthening", null, { fetchImpl: fetchStub, quotaBudget: 20 });
+  assert.equal(job.strengthening.skipped, undefined);
+  assert.equal(job.strengthening.recommendations.length, 1);
+  assert.equal(job.strengthening.recommendations[0].verification, "verified");
+  assert.equal(job.quota.openalex_searches, 3);
+  assert.equal(job.quota.crossref_doi_lookups, 1);
+});
+
+test("Quota: no budget configured means no reservation, existing flow untouched", async () => {
+  const { runStage } = await import("../src/index.mjs");
+  const fetchStub = async () => ({ ok: true, status: 200, json: async () => ({ results: [] }) });
+  const job = { id: "q3", status: "running", events: [], gap: { missing_theories: [{ name: "Diffusion of Innovations" }], rival_theories: [] } };
+  await runStage({}, job, "strengthening", null, { fetchImpl: fetchStub });
+  assert.equal(job.strengthening.recommendations.length, 0);
+  assert.equal(job.strengthening.per_term[0].search_status, "empty");
+  assert.equal(job.quota.openalex_searches, 1);
+});
+
+test("Quota: verifier counts DOI + title calls without changing results", async () => {
+  const { runStage } = await import("../src/index.mjs");
+  const fetchStub = async (url) => {
+    const u = String(url);
+    if (u.includes("api.crossref.org")) return { ok: true, status: 200, json: async () => ({ message: { title: ["DOI work"], author: [{ family: "D", given: "X" }], published: { "date-parts": [[2020]] }, "container-title": ["J"] } }) };
+    return { ok: true, status: 200, json: async () => ({ results: [{ title: "Title work", authorships: [{ author: { display_name: "N" } }], publication_year: 2021, primary_location: { source: { display_name: "K" } }, doi: null }] }) };
+  };
+  const job = { id: "q4", status: "running", events: [], references: ["Davis, 1989. Perceived usefulness. MIS Quarterly. 10.1234/verified.", "Wijaya, 2017. Irrigation scheduling in dry regions."] };
+  await runStage({}, job, "reference_verifier", null, { fetchImpl: fetchStub });
+  assert.equal(job.verifier.verified.length, 1);
+  assert.equal(job.verifier.ambiguous.length, 1);
+  assert.equal(job.verifier.inconclusive.length, 0);
+  assert.equal(job.quota.crossref_doi_lookups, 1);
+  assert.equal(job.quota.openalex_title_lookups, 1);
+});
+
+test("Quota: export carries quota usage + quota_reserved reason (JSON + HTML)", async () => {
+  const { buildReport, buildReportHTML } = await import("../src/export.mjs");
+  const report = buildReport({ id: "t", status: "done", confirmed: false, supervisor: { diagnostic: [], fixes: [] }, result: {}, journal_recommendations: [], quota: { openalex_searches: 9, openalex_title_lookups: 1, crossref_doi_lookups: 5 }, strengthening: { skipped: true, reason: "quota_reserved", recommendations: [], quota: { openalex_searches: 9, openalex_title_lookups: 1, crossref_doi_lookups: 5, openalex_calls: 10, total_api_calls: 15 }, quota_budget: 10, quota_estimate: 4 } });
+  assert.equal(report.quota_usage.openalex_calls, 10);
+  assert.equal(report.quota_usage.total_api_calls, 15);
+  assert.equal(report.strengthening_diagnostics.reason, "quota_reserved");
+  assert.equal(report.strengthening_diagnostics.quota_budget, 10);
+  const html = buildReportHTML(report);
+  assert.ok(html.includes("quota_reserved"));
+  assert.ok(html.includes("Quota usage"));
 });

@@ -9,6 +9,7 @@
 // other label, and no recommendation is ever labelled verified without
 // a database match.
 import { checkByDOI, checkByTitle } from "./database.mjs";
+import { snapshotQuota } from "./quota.mjs";
 
 export function parseReferenceTitle(ref) {
   const m = String(ref).match(/,\s*\d{4}\.\s*(.+?)(?:\.\s+[A-Z][^.]*)?\.?\s*$/);
@@ -23,14 +24,15 @@ export function extractDOI(ref) {
 
 // Verify one manuscript reference against the databases.
 // Returns {reference, status, db} where status is verified/candidate/
-// unresolved. "candidate" is NOT verified.
-export async function verifyReference(ref, fetchImpl = fetch) {
+// unresolved. "candidate" is NOT verified. The optional counter
+// records the outgoing call (call-site counting, see quota.mjs).
+export async function verifyReference(ref, fetchImpl = fetch, counter = null) {
   const doi = extractDOI(ref);
   if (doi) {
-    const db = await checkByDOI(doi, fetchImpl);
+    const db = await checkByDOI(doi, fetchImpl, counter);
     return { reference: ref, status: db.status, db };
   }
-  const db = await checkByTitle(parseReferenceTitle(ref), fetchImpl);
+  const db = await checkByTitle(parseReferenceTitle(ref), fetchImpl, counter);
   return { reference: ref, status: db.status, db };
 }
 
@@ -56,7 +58,7 @@ export async function verifyReference(ref, fetchImpl = fetch) {
 // NOT done here (deferred post-submission per the deadline plan):
 // query_used is the full theory name for now, so any future query
 // experiment can be compared term-by-term against these diagnostics.
-export async function searchStrengthening(queryTerms, fetchImpl = fetch) {
+export async function searchStrengthening(queryTerms, fetchImpl = fetch, counter = null) {
   const allTerms = (queryTerms || []).filter(Boolean);
   const terms = allTerms.slice(0, 2);
   const recommendations = [];
@@ -68,6 +70,9 @@ export async function searchStrengthening(queryTerms, fetchImpl = fetch) {
     let http_status = null;
     let works = [];
     try {
+      // Quota: this search query is one OpenAlex call, counted even
+      // when it 429s or errors — the attempt consumed the budget.
+      if (counter) counter.openalex_searches = (counter.openalex_searches || 0) + 1;
       const res = await fetchImpl(`https://api.openalex.org/works?search=${encodeURIComponent(term)}&per-page=3`, { headers: { Accept: "application/json" }, signal: typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined });
       http_status = res.status;
       if (res.ok) {
@@ -84,7 +89,7 @@ export async function searchStrengthening(queryTerms, fetchImpl = fetch) {
     let t_dropped_inconclusive = 0;
     for (const w of works) {
       const doi = w.doi ? w.doi.replace(/^https:\/\/doi\.org\//, "") : null;
-      const db = doi ? await checkByDOI(doi, fetchImpl) : await checkByTitle(w.title || "", fetchImpl);
+      const db = doi ? await checkByDOI(doi, fetchImpl, counter) : await checkByTitle(w.title || "", fetchImpl, counter);
       if (db.status === "verified" || db.status === "candidate") {
         recommendations.push({
           query: term,
@@ -104,5 +109,5 @@ export async function searchStrengthening(queryTerms, fetchImpl = fetch) {
     }
     per_term.push({ term, query_used: term, search_status, http_status, raw_results: works.length, kept_verified, kept_candidate, dropped_unresolved: t_dropped_unresolved, dropped_inconclusive: t_dropped_inconclusive });
   }
-  return { searched_terms: terms, terms_considered: allTerms.length, recommendations, dropped_unresolved, dropped_inconclusive, per_term };
+  return { searched_terms: terms, terms_considered: allTerms.length, recommendations, dropped_unresolved, dropped_inconclusive, per_term, quota: snapshotQuota(counter) };
 }
