@@ -9,16 +9,20 @@
 export const API_BASE =
   import.meta.env.VITE_API_BASE || "https://marva-backend-worker.imkofty.workers.dev";
 
-// The 7 agents, in pipeline order. `stage` is the backend event stage
-// name; `progress` is the mockup Audit Progress stage it feeds, or null
-// when the mockup progress bar has no slot for it (Journal Matcher and
-// the strengthening step are still shown on their own tiles and in the
-// report — they are never silently counted as another progress stage).
+// The backend pipeline stages, in backend order, plus the Narrator.
+// `stage` is the backend event stage name; `progress` is the mockup
+// Audit Progress stage it feeds, or null when the mockup progress bar
+// has no slot for it. Strengthening IS a real backend stage (between
+// gap and journal) even though it has no room character and no progress
+// slot: omitting it made the "first stage with no event yet" running
+// inference misattribute strengthening's whole window to Journal
+// Matcher. It is never silently counted as another progress stage.
 export const AGENTS = [
   { id: "reader", label: "Reader", stage: "reader", progress: "Structure" },
   { id: "citation", label: "Citation Matcher", stage: "citation_matcher", progress: "Citations" },
   { id: "verifier", label: "Reference Verifier", stage: "reference_verifier", progress: "Reference Consistency" },
   { id: "gap", label: "Gap Assessor", stage: "gap", progress: "Completeness" },
+  { id: "strengthening", label: "Strengthening", stage: "strengthening", progress: null },
   { id: "journal", label: "Journal Matcher", stage: "journal", progress: null },
   { id: "supervisor", label: "Supervisor", stage: "supervisor", progress: "Final" },
   { id: "narrator", label: "Narrator", stage: null, progress: null },
@@ -35,23 +39,33 @@ export const PROGRESS_STAGES = [
 
 // Map backend events to per-agent status: done / skipped / failed /
 // running / waiting. "running" is INFERRED, honestly, from real events:
-// while a job is running, the first pipeline stage with no event yet is
-// the stage currently running. The backend only pushes an event when a
-// stage finishes, so this is the only running-stage signal available.
-// The Narrator has no backend stage: it is "typing" only while any real
-// stage is running (it is rewriting that stage's bubble), and it never
-// produces a bubble of its own.
+// while a job is running, the first pipeline stage with no terminal
+// event yet is the stage currently running. The backend only pushes a
+// terminal event when a stage finishes (the verifier's intermediate
+// "running" events are the exception: they mark that stage running
+// without finishing it), so this is the only running-stage signal
+// available.
+// The Narrator has no backend stage: it is "typing" while the job runs
+// (it is rewriting that stage's bubble), and it never produces a bubble
+// of its own. Its completion signal is the job-completion signal
+// itself — job status "done" from /events, or the backend's
+// {stage:"job", status:"done"} event — so after an audit it is "done",
+// not "waiting". It is never hardcoded to "done": it flips only on
+// that real backend signal. Before any job it stays "waiting".
 export function agentStatuses(events, jobStatus) {
   const byStage = new Map();
   for (const e of events || []) {
     if (e.stage) byStage.set(e.stage, e.status);
   }
-  const running = jobStatus === "running";
+  const jobDone = jobStatus === "done" || byStage.get("job") === "done";
+  // A finished job has no running stage, even if a stale poll still
+  // reports "running" alongside the job-completion event.
+  const running = jobStatus === "running" && !jobDone;
   let runningAssigned = false;
   const out = {};
   for (const a of AGENTS) {
     if (a.id === "narrator") {
-      out.narrator = running ? "typing" : "waiting";
+      out.narrator = jobDone ? "done" : running ? "typing" : "waiting";
       continue;
     }
     const s = byStage.get(a.stage);
@@ -68,25 +82,36 @@ export function agentStatuses(events, jobStatus) {
 }
 
 // Progress bar = real mockup stages finished / total mockup stages.
-// A stage counts as finished only when its backend stage event is
-// "done" (skipped/failed do not count as done, and are shown as such).
+// A stage counts as finished when its backend stage event is TERMINAL:
+// "done", "skipped" or "failed". The verifier's intermediate "running"
+// events are not terminal and never count. Skipped/failed are NOT
+// counted as successful: the agent's tile still shows skipped/failed
+// and the meeting log still shows it — the bar counts pipeline
+// completion, not success. Counting only "done" left the bar stuck
+// below 5/5 on every partial job (e.g. citation skipped when no
+// reference list exists) even after the audit was fully over.
 // Never a fixed percentage, never an estimated time: with no backend
 // timing data, no time estimate is shown at all.
+const TERMINAL_STAGE_STATUSES = ["done", "skipped", "failed"];
 export function progress(events) {
   const byStage = new Map();
   for (const e of events || []) {
     if (e.stage) byStage.set(e.stage, e.status);
   }
-  const done = [];
+  const finished = [];
   for (const a of AGENTS) {
-    if (a.progress && byStage.get(a.stage) === "done") done.push(a.progress);
+    if (a.progress && TERMINAL_STAGE_STATUSES.includes(byStage.get(a.stage))) finished.push(a.progress);
   }
-  const stages = PROGRESS_STAGES.map((name) => ({
-    name,
-    done: done.includes(name),
-  }));
-  const pct = Math.round((done.length / PROGRESS_STAGES.length) * 100);
-  return { stages, doneCount: done.length, total: PROGRESS_STAGES.length, pct };
+  const stages = PROGRESS_STAGES.map((name) => {
+    const agent = AGENTS.find((a) => a.progress === name);
+    return {
+      name,
+      done: byStage.get(agent.stage) === "done",
+      finished: finished.includes(name),
+    };
+  });
+  const pct = Math.round((finished.length / PROGRESS_STAGES.length) * 100);
+  return { stages, finishedCount: finished.length, total: PROGRESS_STAGES.length, pct };
 }
 
 async function getJson(path) {

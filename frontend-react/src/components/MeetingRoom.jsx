@@ -35,7 +35,18 @@ const EYE_GROUPS = [
   { id: "supervisor", skin: "#c89e7a", eyes: [[1117, 180], [1161, 173]] },
 ];
 
-export default function MeetingRoom({ statuses, bubbles, live }) {
+// Display label only — the internal status code ("waiting" etc. from
+// lib/api.js agentStatuses) is NOT changed here, so audit-run logic is
+// untouched. Idle state shows "Idle" (full phrase on a fresh homepage
+// with no job yet); running/done/skipped/failed keep their own labels.
+function statusLabel(code, jobStatus) {
+  if (code === "waiting" || !code) {
+    return jobStatus == null ? "Idle — menunggu audit dimulai" : "Idle";
+  }
+  return code;
+}
+
+export default function MeetingRoom({ statuses, bubbles, live, jobStatus }) {
   const [blinking, setBlinking] = useState({});
   useEffect(() => {
     let cancelled = false;
@@ -71,7 +82,7 @@ export default function MeetingRoom({ statuses, bubbles, live }) {
                 width: `${(c.w / PW) * 100}%`, zIndex: c.id === "narrator" || c.id === "supervisor" || c.id === "reader" ? 3 : 2,
                 animationDelay: `${(ci * 0.4).toFixed(1)}s`,
               }}
-              title={`${c.label} — ${statuses[c.id] || "waiting"}`}
+              title={`${c.label} — ${statusLabel(statuses[c.id], jobStatus)}`}
             >
               <img src={`/sprites-sam/${c.id}.png`} alt={c.label} />
               {active && (
@@ -106,7 +117,7 @@ export default function MeetingRoom({ statuses, bubbles, live }) {
       <div className="marva-room-bar">
         <div className="marva-room-labels-bar">
           {LAYERS.map((c) => (
-            <span key={c.id} title={`${c.label} — ${statuses[c.id] || "waiting"}`}>
+            <span key={c.id} title={`${c.label} — ${statusLabel(statuses[c.id], jobStatus)}`}>
               <span className="marva-fur-dot" style={{ background: c.fur }} /> {c.label} <span className={`marva-dot marva-dot-${statuses[c.id] || "waiting"}`} />
             </span>
           ))}

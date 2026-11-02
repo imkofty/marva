@@ -18,6 +18,17 @@ import {
 const HISTORY_KEY = "marva-history";
 const MAX_MB = 50; // Mockup label: "Max. 50MB". Enforced client-side.
 
+// W1: local-only marker for a history entry whose job no longer exists
+// on the server (GET /jobs/:id -> 404, e.g. deleted after export).
+// It is NEVER sent to the server and NEVER presented as a server
+// status; the list renders it as "Tidak lagi tersedia di server".
+// The entry itself is kept, never silently deleted.
+const HISTORY_GONE = "unavailable";
+
+function historyStatusLabel(entry) {
+  return entry.status === HISTORY_GONE ? "Tidak lagi tersedia di server" : entry.status;
+}
+
 function loadHistory() {
   try {
     return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
@@ -109,6 +120,52 @@ export default function App() {
   }, []);
 
   useEffect(() => () => stopPolling(), []);
+
+  // W1: homepage-load reconciliation. History lives in this browser's
+  // localStorage, not on the server, so a stale "running" entry (e.g.
+  // job 443: finished, exported, then deleted via API) would otherwise
+  // keep showing "running" forever. On load, every non-final ("running")
+  // entry with a jobId is re-checked against the existing endpoint
+  // GET /jobs/:id (fetchJob): 404 -> local label becomes
+  // "Tidak lagi tersedia di server" and "running" stops; a live
+  // non-running status (e.g. "done") replaces the stale one; a still-
+  // running job is left alone. Any non-404 failure (network, 5xx) is
+  // NOT proof the job is gone, so the entry is left untouched rather
+  // than mislabelled. Entries are never deleted here.
+  // Runs once on mount; the functional update preserves entries added
+  // while the checks are in flight.
+  useEffect(() => {
+    let cancelled = false;
+    const stale = history.filter((h) => h.jobId && h.status === "running");
+    if (stale.length === 0) return undefined;
+    (async () => {
+      const updates = new Map();
+      await Promise.all(
+        stale.map(async (h) => {
+          try {
+            const job = await fetchJob(h.jobId);
+            if (job.status && job.status !== "running") updates.set(h.jobId, job.status);
+          } catch (e) {
+            if (/\b404\b/.test(e.message || "")) updates.set(h.jobId, HISTORY_GONE);
+          }
+        })
+      );
+      if (cancelled || updates.size === 0) return;
+      setHistory((prev) => {
+        const next = prev.map((h) => (updates.has(h.jobId) ? { ...h, status: updates.get(h.jobId) } : h));
+        try {
+          localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+        } catch {
+          /* private-mode storage failure: history is best-effort only */
+        }
+        return next;
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only reconciliation
+  }, []);
 
   // Pause polling while the tab is hidden; resume (with an immediate
   // refresh) when it becomes visible again, but only while the job is
@@ -211,6 +268,17 @@ export default function App() {
   const openHistory = (entry) => {
     if (!entry.jobId) {
       if (entry.kind === "synthetic-demo") runSynthetic();
+      return;
+    }
+    // W1: a job already known gone must not restart polling as
+    // "running". Select it (so "Remove from this browser's history"
+    // still targets it) and say so honestly instead.
+    if (entry.status === HISTORY_GONE) {
+      setJobId(entry.jobId);
+      setJobStatus(null);
+      setEvents([]);
+      setReport(null);
+      setNotice("Job ini tidak lagi tersedia di server — entri ini hanya tersisa di riwayat browser ini. Gunakan \"Remove from this browser's history\" untuk menghapusnya.");
       return;
     }
     pollJob(entry.jobId);
@@ -373,6 +441,11 @@ export default function App() {
           </p>
 
           <h3>Upload History</h3>
+          <p className="marva-meta marva-small">
+            Riwayat ini disimpan di browser ini saja, bukan status live server.
+            Entri berstatus running dicek ulang ke server saat halaman dimuat;
+            bila job sudah tidak ada, labelnya menjadi &ldquo;Tidak lagi tersedia di server&rdquo;.
+          </p>
           {history.length === 0 ? (
             <p className="marva-meta">No uploads yet. Upload a PDF to start your first audit.</p>
           ) : (
@@ -383,7 +456,7 @@ export default function App() {
                     📄 {h.fileName}
                     {h.sizeBytes != null && <> • {fmtBytes(h.sizeBytes)}</>}
                     {" • "}{new Date(h.createdAt).toLocaleDateString()}
-                    {" • "}{h.status}
+                    {" • "}{historyStatusLabel(h)}
                   </button>
                 </li>
               ))}
@@ -410,7 +483,21 @@ export default function App() {
             <h2>Live Meeting Room — Pre-Submit Review Session</h2>
             <span className="marva-live-badge">● Live • 7 participants</span>
           </div>
-          <MeetingRoom statuses={statuses} bubbles={bubbles} live={jobStatus === "running"} />
+          <MeetingRoom statuses={statuses} bubbles={bubbles} live={jobStatus === "running"} jobStatus={jobStatus} />
+        </section>
+
+        <section className="marva-card">
+          <h2>Hasil terverifikasi</h2>
+          <p className="marva-meta">Angka statis dari ekspor beku — panel ini tidak menjalankan job live apa pun.</p>
+          <ul>
+            <li><strong>20/20</strong> paper uji terverifikasi live.</li>
+            <li>Kasus paper 435 berkunci: inconclusive <strong>12 → 0</strong> setelah kunci OpenAlex dipasang.</li>
+            <li>Jurnal <strong>0</strong> — jujur, bukan kosong misterius: hanya <strong>1</strong> referensi terverifikasi (Microorganisms), di bawah ambang penamaan <strong>2</strong>, jadi tidak ada jurnal yang dinamai.</li>
+          </ul>
+          <p>
+            <a href="/contoh-laporan-435.json">Lihat contoh laporan</a>
+            <span className="marva-meta"> — ekspor beku statis paper 435 (JSON), bukan job live.</span>
+          </p>
         </section>
 
         <section className="marva-card">
@@ -432,27 +519,35 @@ export default function App() {
         <section className="marva-card">
           <h2>Audit Progress</h2>
           <p>
-            {prog.pct}% ({prog.doneCount} of {prog.total} stages done)
+            {prog.pct}% ({prog.finishedCount} of {prog.total} stages finished)
           </p>
-          <div className="marva-bar" aria-label={`${prog.pct}% of stages done`}>
+          <div className="marva-bar" aria-label={`${prog.pct}% of stages finished`}>
             <div className="marva-bar-fill" style={{ width: `${prog.pct}%` }} />
           </div>
           <ul className="marva-stages">
             {prog.stages.map((s) => (
-              <li key={s.name} className={s.done ? "done" : ""}>
-                {s.done ? "✓" : "○"} {s.name}
+              <li key={s.name} className={s.finished ? "done" : ""}>
+                {s.done ? "✓" : s.finished ? "–" : "○"} {s.name}
               </li>
             ))}
           </ul>
           <p className="marva-meta">
-            Progress is real stages finished / total stages. No completion
+            Progress is real stages finished / total stages. A ✓ stage
+            finished successfully; a – stage finished skipped or failed
+            (its tile and the meeting log still show which). No completion
             time is estimated, because the backend provides no timing data.
           </p>
           <div className="marva-actions">
-            <button className="marva-btn" onClick={() => onExport("json")}>Export JSON</button>{" "}
-            <button className="marva-btn" onClick={() => onExport("html")}>Export HTML</button>{" "}
-            <button className="marva-btn" onClick={() => onExport("pdf")}>Export PDF</button>{" "}
-            <button className="marva-btn marva-btn-danger" onClick={onDelete}>Delete job</button>{" "}
+            {/* W4: Export needs a real finished job + its report (a synthetic
+                demo sets report but no jobId, so it must NOT enable export:
+                there is no per-job backend report to download for it).
+                Delete needs a selected job. Handlers keep their no-job
+                guards as backstop; the buttons themselves no longer fire
+                without a job/report. Tooltip text is the spec string. */}
+            <button className="marva-btn" onClick={() => onExport("json")} disabled={!jobId || !report} title={!jobId || !report ? "Tersedia setelah audit selesai" : undefined}>Export JSON</button>{" "}
+            <button className="marva-btn" onClick={() => onExport("html")} disabled={!jobId || !report} title={!jobId || !report ? "Tersedia setelah audit selesai" : undefined}>Export HTML</button>{" "}
+            <button className="marva-btn" onClick={() => onExport("pdf")} disabled={!jobId || !report} title={!jobId || !report ? "Tersedia setelah audit selesai" : undefined}>Export PDF</button>{" "}
+            <button className="marva-btn marva-btn-danger" onClick={onDelete} disabled={!jobId} title={!jobId ? "Tersedia setelah audit selesai" : undefined}>Delete job</button>{" "}
             <button className="marva-btn marva-btn-secondary" onClick={removeLocal}>
               Remove from this browser's history
             </button>
