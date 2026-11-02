@@ -55,7 +55,7 @@ export function mapDiagnosticToDimensions(job) {
   for (const t of job.gap?.rival_theories || []) push("Novelty", { finding: `Rival theory not discussed: ${t.name}`, evidence: t.why || null, source: "gap-assessor" });
   for (const r of job.gap?.outdated_references || []) push("Rigor", { finding: `Outdated reference: ${r}`, evidence: "gap assessor flagged as outdated", source: "gap-assessor" });
   for (const f of job.journal?.fields || []) push("Suitability", { finding: `Classified field: ${f.name}`, evidence: f.evidence || null, source: "journal-matcher" });
-  for (const rec of job.journal_recommendations || []) push("Suitability", { finding: `Journal candidate (scope evidence only): ${rec.journal}`, evidence: `Recent OpenAlex works in ${rec.scope_evidence.fields.join(", ")}`, source: "journal-evidence" });
+  for (const rec of job.journal_recommendations || []) push("Suitability", { finding: `Journal candidate (scope evidence only): ${rec.journal}`, evidence: rec.evidence || `Recent OpenAlex works in ${(rec.scope_evidence?.fields || []).join(", ")}`, source: "journal-evidence" });
 
   return DIMENSIONS.map((d) => {
     if (d === "References" && citationSkipped) {

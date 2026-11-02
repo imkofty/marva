@@ -1,3 +1,61 @@
+// Venue-based journal recommendations (submission version, 2026-11-02).
+// Built ONLY from the paper's own DOI-verified references: the verifier
+// already paid for their Crossref metadata, so this path costs ZERO
+// new OpenAlex searches and cannot 429. A venue is named ONLY when at
+// least THRESHOLD verified references of this paper were published in
+// it; below that, only the classified fields are shown, with the
+// reason written out. The label is deliberately NOT "best journal":
+// it is "journal from this paper's citation trail" — venues the author
+// already cites, not a prediction of acceptance and not a Scopus
+// claim (scopus_indexed_status stays "unverified" always).
+// verifiedVenues entries: { journal, doi, reference } as recorded by
+// the verifier stage (Crossref container-title for DOI-verified refs).
+// Entries without a journal name are ignored: a venue that cannot be
+// named from database metadata must not be guessed from a reference
+// string.
+export function buildVenueRecommendations(verifiedVenues, fields) {
+  const THRESHOLD = 2;
+  const fieldNames = (fields || []).map((f) => f.name).filter(Boolean);
+  const byVenue = new Map();
+  const used = (verifiedVenues || []).filter((v) => v && v.journal);
+  for (const v of used) {
+    const key = v.journal.trim().toLowerCase();
+    if (!byVenue.has(key)) byVenue.set(key, { journal: v.journal, refs: [] });
+    byVenue.get(key).refs.push({ doi: v.doi || null, reference: v.reference || null });
+  }
+  const recommendations = [];
+  const venues_found = [];
+  for (const entry of byVenue.values()) {
+    venues_found.push({ journal: entry.journal, count: entry.refs.length });
+    if (entry.refs.length >= THRESHOLD) {
+      const evidence = `${entry.refs.length} dari ${used.length} referensi terverifikasi paper ini terbit di jurnal ini`;
+      recommendations.push({
+        journal: entry.journal,
+        scope_evidence: {
+          fields: fieldNames,
+          recent_works: entry.refs,
+          note: "Jurnal dari jejak sitasi paper ini: venue dari referensi terverifikasi DOI paper itu sendiri, bukan prediksi penerimaan dan bukan klaim Scopus.",
+        },
+        verification: "citation-trail",
+        scopus_indexed_status: "unverified",
+        evidence,
+      });
+    }
+  }
+  venues_found.sort((a, b) => b.count - a.count);
+  return {
+    recommendations,
+    diagnostics: {
+      source: "citation-trail",
+      verified_refs_used: used.length,
+      threshold: THRESHOLD,
+      venues_found,
+      field_search: { status: "skipped", reason: "Penamaan jurnal versi submission memakai jejak sitasi terverifikasi; pencarian bidang OpenAlex tidak dipakai sebagai sumber penamaan." },
+      scopus: "unverified",
+    },
+  };
+}
+
 // Journal recommendations, built from real database evidence only.
 // Ported from backend-node/src/lib/journal-evidence.mjs, minus Scopus:
 // the Worker has no SCOPUS_API_KEY, so scopus_indexed_status is always

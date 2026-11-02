@@ -16,6 +16,24 @@ export async function checkByDOI(doi, fetchImpl = fetch) {
   } catch (e) { return { status: "unresolved", reason: String(e.message || e) }; }
 }
 
+// Wrap a fetch implementation so OpenAlex calls carry the free API key
+// when one is configured (Worker secret OPENALEX_API_KEY). Only
+// api.openalex.org URLs are touched; every other host passes through
+// unchanged. An unknown query parameter is ignored by OpenAlex, so
+// sending api_key can never break an anonymous call — worst case the
+// key is ignored and the call behaves exactly as before. No key means
+// no wrapper behaviour at all (the original fetch is returned as-is).
+export function withOpenAlexKey(fetchImpl, apiKey) {
+  if (!apiKey) return fetchImpl;
+  return (url, opts) => {
+    try {
+      const u = new URL(String(url));
+      if (u.hostname === "api.openalex.org") u.searchParams.set("api_key", apiKey);
+      return fetchImpl(u.toString(), opts);
+    } catch { return fetchImpl(url, opts); }
+  };
+}
+
 export async function checkByTitle(title, fetchImpl = fetch) {
   if (!title) return { status: "unresolved", reason: "No title" };
   try {

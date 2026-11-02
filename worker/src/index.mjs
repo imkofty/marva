@@ -42,7 +42,8 @@ import { runAgent, escalateAmbiguous } from "./agents.mjs";
 import { runCrosscheck } from "./crosscheck.mjs";
 import { extractTextFromPdf } from "./pdf.mjs";
 import { verifyReference, searchStrengthening, extractDOI } from "./strengthening.mjs";
-import { buildJournalRecommendations } from "./journal-evidence.mjs";
+import { withOpenAlexKey } from "./database.mjs";
+import { buildVenueRecommendations } from "./journal-evidence.mjs";
 import { buildReport, buildReportHTML, buildReportPDF } from "./export.mjs";
 import { loadJob, saveJob, loadActive, saveActive, clearActiveIf, deleteJob } from "./store.mjs";
 import { SYNTHETIC_DEMO } from "./demo.mjs";
@@ -238,7 +239,11 @@ import { matchCitations as _origMatch } from "./citation-matcher.mjs";
 export const STAGES = ["reader", "citation_matcher", "reference_verifier", "gap", "strengthening", "journal", "supervisor"];
 
 export async function runStage(env, job, stage, text, deps = {}) {
-  const fetchImpl = deps.fetchImpl || fetch;
+  // OpenAlex free API key (Worker secret OPENALEX_API_KEY, set separately
+  // from MODEL_API_KEY): when present, every api.openalex.org call made
+  // through fetchImpl carries it. When absent, fetchImpl is untouched
+  // and calls behave exactly as before (anonymous pool).
+  const fetchImpl = withOpenAlexKey(deps.fetchImpl || fetch, env.OPENALEX_API_KEY || "");
   const apiKey = deps.apiKey !== undefined ? deps.apiKey : (env.MODEL_API_KEY || "");
   const hasKey = !!apiKey && apiKey !== "REPLACE_AT_DEPLOY_VIA_WRANGLER_SECRET";
   const agentDeps = { fetchImpl, apiKey: hasKey ? apiKey : "" };
@@ -440,7 +445,7 @@ export async function runStage(env, job, stage, text, deps = {}) {
       if (!prog) {
         const order = refs.map((ref, i) => ({ i, doi: !!extractDOI(ref) }));
         order.sort((a, b) => (b.doi - a.doi) || (a.i - b.i));
-        prog = { order: order.map((o) => o.i), pos: 0, verified: [], flagged: [], ambiguous: [], inconclusive: [] };
+        prog = { order: order.map((o) => o.i), pos: 0, verified: [], verified_venues: [], flagged: [], ambiguous: [], inconclusive: [] };
       }
       // Wonder #2: batch 8 -> 24, guarded by a ~20s wall-clock budget
       // (not by guesswork about per-ref latency). The budget is the
@@ -499,7 +504,15 @@ export async function runStage(env, job, stage, text, deps = {}) {
             try { await env.MARVA_JOBS.put(`verify:doi:${doi}`, JSON.stringify(v.db), { expirationTtl: 30 * 24 * 3600 }); cachedThisBatch.add(doi); } catch {}
           }
         }
-        if (v.status === "verified") prog.verified.push(ref);
+        if (v.status === "verified") {
+          prog.verified.push(ref);
+          // Venue trail for the journal stage (P6 fix, 2026-11-02):
+          // Crossref container-title of this DOI-verified reference.
+          // Additive only — verified stays a plain string list, and
+          // refs without a journal name leave no venue entry (a venue
+          // must never be guessed from the reference string).
+          if (v.db?.journal) prog.verified_venues.push({ journal: v.db.journal, doi: doi || null, reference: ref });
+        }
         else if (v.status === "candidate") prog.ambiguous.push({ reference: ref, db: v.db });
         else prog.flagged.push({ reference: ref, reason: v.db?.reason || "unresolved" });
         prog.pos += 1;
@@ -522,7 +535,7 @@ export async function runStage(env, job, stage, text, deps = {}) {
       job.verifier_retry_after = 0;
       job.backoff_level = 0;
       job.verifier_progress = null;
-      job.verifier = { verified: prog.verified, flagged: prog.flagged, ambiguous: prog.ambiguous.map((a) => a.reference), inconclusive: prog.inconclusive };
+      job.verifier = { verified: prog.verified, verified_venues: prog.verified_venues || [], flagged: prog.flagged, ambiguous: prog.ambiguous.map((a) => a.reference), inconclusive: prog.inconclusive };
       if (prog.ambiguous.length > 0 && hasKey) {
         const esc = await escalateAmbiguous(prog.ambiguous.map((a) => a.reference), agentDeps);
         job.verifier.wonder_reviewed = esc.data || null;
@@ -573,7 +586,7 @@ export async function runStage(env, job, stage, text, deps = {}) {
         await pushEvent(env, job, { stage: "strengthening", status: "skipped", detail: "No gap theories to search for" });
       } else {
         job.strengthening = await searchStrengthening(terms, fetchImpl);
-        await pushEvent(env, job, { stage: "strengthening", status: "done", detail: `Recommendations: ${job.strengthening.recommendations.length} (verified or candidate only), dropped unresolved: ${job.strengthening.dropped_unresolved}` });
+        await pushEvent(env, job, { stage: "strengthening", status: "done", detail: `Recommendations: ${job.strengthening.recommendations.length} (verified or candidate only), dropped unresolved: ${job.strengthening.dropped_unresolved}, dropped inconclusive: ${job.strengthening.dropped_inconclusive}` });
       }
     } catch (e) {
       job.strengthening = null;
@@ -590,16 +603,25 @@ export async function runStage(env, job, stage, text, deps = {}) {
         const j = await runAgent("journal", { reader: job.reader || null, references: job.references }, agentDeps);
         if (j.data) {
           job.journal = { ...j.data, scopus_indexed_status: "unverified" };
-          // Journal recommendations from real OpenAlex evidence only.
-          // A failed/empty search leaves an empty list, honestly reported
-          // by the export layer, never filled with an invented journal.
+          // Journal recommendations, submission version (P6 fix,
+          // 2026-11-02): venues of this paper's own DOI-verified
+          // references ONLY — zero new searches, so this stage cannot
+          // 429. The old OpenAlex field-search path
+          // (buildJournalRecommendations) is deliberately NOT used for
+          // naming here: it failed silently at the end of the pipeline
+          // in every completed job, and naming from per-page=3 field
+          // searches without an evidence threshold is soft fabrication.
+          // It stays exported (and tested) for reference, but the
+          // submission naming source is the citation trail.
           try {
-            const ev = await buildJournalRecommendations(j.data.fields || [], fetchImpl);
-            job.journal_recommendations = ev.recommendations;
+            const venue = buildVenueRecommendations(job.verifier?.verified_venues || [], j.data.fields || []);
+            job.journal_recommendations = venue.recommendations;
+            job.journal_diagnostics = venue.diagnostics;
           } catch {
             job.journal_recommendations = [];
+            job.journal_diagnostics = null;
           }
-          await pushEvent(env, job, { stage: "journal", status: "done", detail: `Fields: ${(j.data.fields || []).map((f) => f.name).join(", ") || "none"}; journal recommendations: ${(job.journal_recommendations || []).length} (OpenAlex evidence only)` });
+          await pushEvent(env, job, { stage: "journal", status: "done", detail: `Fields: ${(j.data.fields || []).map((f) => f.name).join(", ") || "none"}; journal recommendations: ${(job.journal_recommendations || []).length} (citation-trail evidence only)` });
         } else {
           job.journal = null;
           await pushEvent(env, job, { stage: "journal", status: "failed", detail: j.error || "Journal failed" });

@@ -35,6 +35,14 @@ export function buildReport(job) {
     journal: job.journal || null,
     journal_recommendations: job.journal_recommendations || [],
     strengthening_references: job.strengthening ? job.strengthening.recommendations || [] : null,
+    // P6 diagnostics (2026-11-02): why a zero is a zero. These fields
+    // are additive — the recommendation lists above are unchanged.
+    strengthening_diagnostics: job.strengthening
+      ? (job.strengthening.skipped
+        ? { skipped: true, reason: job.strengthening.reason || null }
+        : { terms_considered: job.strengthening.terms_considered ?? null, searched_terms: job.strengthening.searched_terms || [], per_term: job.strengthening.per_term || [], dropped_unresolved: job.strengthening.dropped_unresolved ?? 0, dropped_inconclusive: job.strengthening.dropped_inconclusive ?? 0 })
+      : null,
+    journal_diagnostics: job.journal_diagnostics || null,
     // Honest empty-result notes: an empty recommendation list is a
     // real outcome (search failed, or no candidate verified enough),
     // never a bug to hide and never a reason to invent a journal or
@@ -44,7 +52,7 @@ export function buildReport(job) {
         ? ["No strengthening reference was verified enough to show in this job. Candidates that could not be verified were dropped, never shown as certain."]
         : []),
       ...((job.journal_recommendations || []).length === 0
-        ? ["No journal recommendation was verified enough to show in this job. Journals are listed only when a recent OpenAlex work in a classified field names them; Scopus status is always unverified unless a Scopus check really returns a match."]
+        ? ["No journal recommendation was verified enough to show in this job. Journals are named only when at least 2 verified references of this paper were published in them (citation-trail evidence); below that threshold only the classified fields are shown. Scopus status is always unverified unless a Scopus check really returns a match."]
         : []),
     ],
     fixes: job.supervisor?.fixes || [],
@@ -58,7 +66,7 @@ export function buildReport(job) {
 export function buildReportHTML(report) {
   const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
   const dims = (report.dimensions || []).map((d) => `<h3>${esc(d.dimension)} (${d.count})</h3>${d.note ? `<p>${esc(d.note)}</p>` : ""}<pre>${esc(JSON.stringify(d.items, null, 2))}</pre>`).join("");
-  return `<!doctype html><html><head><meta charset="utf-8"><title>MARVA Report</title></head><body><h1>MARVA Report</h1><p>Job: ${esc(report.jobId)}</p><p>Author confirmed: ${report.confirmed ? "yes" : "no"}</p><p>${esc(report.confirmation_note || "")}</p><h2>Per-dimension diagnostic</h2>${dims}<h2>Citation flags</h2><pre>${esc(JSON.stringify(report.citation_flags, null, 2))}</pre><h2>Diagnostic</h2><pre>${esc(JSON.stringify(report.diagnostic, null, 2))}</pre><h2>Strengthening references (verified or candidate only)</h2><pre>${esc(JSON.stringify(report.strengthening_references, null, 2))}</pre><h2>Limitations</h2><ul>${report.limitations.map((l) => `<li>${esc(l)}</li>`).join("")}</ul><p>${esc(report.ai_disclosure)}</p></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>MARVA Report</title></head><body><h1>MARVA Report</h1><p>Job: ${esc(report.jobId)}</p><p>Author confirmed: ${report.confirmed ? "yes" : "no"}</p><p>${esc(report.confirmation_note || "")}</p><h2>Per-dimension diagnostic</h2>${dims}<h2>Citation flags</h2><pre>${esc(JSON.stringify(report.citation_flags, null, 2))}</pre><h2>Diagnostic</h2><pre>${esc(JSON.stringify(report.diagnostic, null, 2))}</pre><h2>Strengthening references (verified or candidate only)</h2><pre>${esc(JSON.stringify(report.strengthening_references, null, 2))}</pre><h2>Strengthening diagnostics (why a zero is a zero)</h2><pre>${esc(JSON.stringify(report.strengthening_diagnostics, null, 2))}</pre><h2>Journal diagnostics</h2><pre>${esc(JSON.stringify(report.journal_diagnostics, null, 2))}</pre><h2>Limitations</h2><ul>${report.limitations.map((l) => `<li>${esc(l)}</li>`).join("")}</ul><p>${esc(report.ai_disclosure)}</p></body></html>`;
 }
 
 // Minimal PDF export, same text-summary shape as backend-node.

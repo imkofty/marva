@@ -738,3 +738,82 @@ test("DO migration: invalid stored progress is a hard 500, never a silent reset"
   const res = await stub.fetch(new Request("http://do/state?id=do-bad"));
   assert.equal(res.status, 500);
 });
+
+// P6 mandatory package (2026-11-02): whitelist labels, per-term
+// diagnostics, citation-trail journal venues, OpenAlex key wrapper.
+test("P6 whitelist: inconclusive strengthening candidates are dropped and counted", async () => {
+  const { searchStrengthening } = await import("../src/strengthening.mjs");
+  const okSearch = { ok: true, status: 200, json: async () => ({ results: [{ title: "Some theory work", doi: "https://doi.org/10.1234/rate-limited", authorships: [], publication_year: 2021, primary_location: { source: { display_name: "Some Journal" } } }] }) };
+  // Case 1: Crossref 429 on re-verification -> inconclusive -> dropped, never shown.
+  const fetch429 = async (url) => {
+    if (String(url).includes("api.openalex.org")) return okSearch;
+    return { ok: false, status: 429, json: async () => ({}) };
+  };
+  const r1 = await searchStrengthening(["Some theory framework"], fetch429);
+  assert.equal(r1.recommendations.length, 0);
+  assert.equal(r1.dropped_inconclusive, 1);
+  assert.equal(r1.per_term[0].search_status, "ok");
+  assert.equal(r1.per_term[0].dropped_inconclusive, 1);
+  // Case 2: Crossref 200 -> verified -> shown with the verified label.
+  const fetchOk = async (url) => {
+    if (String(url).includes("api.openalex.org")) return okSearch;
+    return { ok: true, status: 200, json: async () => ({ message: { title: ["Some theory work"], author: [{ family: "Test", given: "A" }], published: { "date-parts": [[2021]] }, "container-title": ["Some Journal"] } }) };
+  };
+  const r2 = await searchStrengthening(["Some theory framework"], fetchOk);
+  assert.equal(r2.recommendations.length, 1);
+  assert.equal(r2.recommendations[0].verification, "verified");
+  assert.equal(r2.per_term[0].kept_verified, 1);
+});
+
+test("P6 diagnostics: OpenAlex search 429 is recorded as rate_limited, not silent", async () => {
+  const { searchStrengthening } = await import("../src/strengthening.mjs");
+  const fetch429 = async () => ({ ok: false, status: 429, json: async () => ({}) });
+  const r = await searchStrengthening(["Some theory framework"], fetch429);
+  assert.equal(r.recommendations.length, 0);
+  assert.equal(r.per_term[0].search_status, "rate_limited");
+  assert.equal(r.per_term[0].http_status, 429);
+  assert.equal(r.per_term[0].raw_results, 0);
+  assert.equal(r.terms_considered, 1);
+});
+
+test("P6 journal venue: threshold 2 names a journal, below threshold only fields", async () => {
+  const { buildVenueRecommendations } = await import("../src/journal-evidence.mjs");
+  const venues = [
+    { journal: "MIS Quarterly", doi: "10.1234/a", reference: "Davis, 1989." },
+    { journal: "MIS Quarterly", doi: "10.1234/b", reference: "Venkatesh, 2003." },
+    { journal: "Other Journal", doi: "10.1234/c", reference: "Patel, 2018." },
+  ];
+  const v = await buildVenueRecommendations(venues, [{ name: "Information Systems" }]);
+  assert.equal(v.recommendations.length, 1);
+  assert.equal(v.recommendations[0].journal, "MIS Quarterly");
+  assert.equal(v.recommendations[0].verification, "citation-trail");
+  assert.equal(v.recommendations[0].scopus_indexed_status, "unverified");
+  assert.ok(v.recommendations[0].evidence.includes("2 dari 3"));
+  assert.equal(v.diagnostics.threshold, 2);
+  assert.equal(v.diagnostics.field_search.status, "skipped");
+  const v2 = await buildVenueRecommendations([{ journal: "Solo Journal", doi: "10.1234/x", reference: "Solo, 2020." }], [{ name: "Field" }]);
+  assert.equal(v2.recommendations.length, 0);
+  assert.equal(v2.diagnostics.venues_found[0].count, 1);
+});
+
+test("P6 OpenAlex key wrapper: api_key only on api.openalex.org", async () => {
+  const { withOpenAlexKey } = await import("../src/database.mjs");
+  const seen = [];
+  const base = async (url) => { seen.push(String(url)); return { ok: true }; };
+  const wrapped = withOpenAlexKey(base, "test-key-123");
+  await wrapped("https://api.openalex.org/works?search=test");
+  await wrapped("https://api.crossref.org/works/10.1234/x");
+  assert.ok(seen[0].includes("api_key=test-key-123"));
+  assert.ok(!seen[1].includes("api_key"));
+  const plain = withOpenAlexKey(base, "");
+  assert.equal(plain, base);
+});
+
+test("P6 export carries strengthening and journal diagnostics", async () => {
+  const { buildReport } = await import("../src/export.mjs");
+  const report = buildReport({ id: "t", status: "done", confirmed: false, supervisor: { diagnostic: [], fixes: [] }, result: {}, journal_recommendations: [], journal_diagnostics: { source: "citation-trail", threshold: 2 }, strengthening: { recommendations: [], terms_considered: 8, searched_terms: ["A"], per_term: [{ term: "A", search_status: "rate_limited" }], dropped_unresolved: 0, dropped_inconclusive: 0 } });
+  assert.equal(report.strengthening_diagnostics.searched_terms[0], "A");
+  assert.equal(report.strengthening_diagnostics.per_term[0].search_status, "rate_limited");
+  assert.equal(report.journal_diagnostics.source, "citation-trail");
+  assert.ok(report.recommendation_notes.join(" ").includes("verified enough"));
+});
