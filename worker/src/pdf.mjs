@@ -200,20 +200,49 @@ function markSuperscripts(runs) {
 // stream keyword or endobj, so a window never swallows the NEXT
 // object's dict (a stream followed by a /Page dict within 4000
 // chars would otherwise be misclassified as a page itself).
-function dictWindow(raw, start) {
+// 328 fix (2026-11-03): dictWindow used to call raw.indexOf() per
+// header, and that scan runs forward to the NEXT stream — which for
+// dict-only objects can be most of the file away. With 2754 headers
+// in epmc2-328 that one call cost ~5.0s of the ~5.1s analyzePdf and
+// pushed the POST handler past the live Worker CPU budget (1102),
+// while 443 (711 headers, ~1.3s) and 435 (2060 headers, ~1.9s) still
+// passed. The positions are now collected once (one linear pass)
+// and looked up by binary search: identical window semantics, no
+// per-header scan. Callers without precomputed arrays keep the old
+// indexOf path, so the function stays usable standalone.
+export function collectNeedlePositions(raw, needle) {
+  const positions = [];
+  let pos = raw.indexOf(needle, 0);
+  while (pos >= 0) {
+    positions.push(pos);
+    pos = raw.indexOf(needle, pos + 1);
+  }
+  return positions;
+}
+
+export function nextPosAtOrAfter(positions, start) {
+  let lo = 0, hi = positions.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (positions[mid] < start) lo = mid + 1; else hi = mid;
+  }
+  return lo < positions.length ? positions[lo] : -1;
+}
+
+function dictWindow(raw, start, streamPos, endobjPos) {
   let winEnd = start + 4000;
-  const s = raw.indexOf("\nstream", start);
-  const e = raw.indexOf("endobj", start);
+  const s = streamPos ? nextPosAtOrAfter(streamPos, start) : raw.indexOf("\nstream", start);
+  const e = endobjPos ? nextPosAtOrAfter(endobjPos, start) : raw.indexOf("endobj", start);
   if (s >= 0) winEnd = Math.min(winEnd, s);
   if (e >= 0) winEnd = Math.min(winEnd, e);
   return raw.slice(start, winEnd);
 }
 
-function parsePageObjects(raw, headers) {
+function parsePageObjects(raw, headers, streamPos, endobjPos) {
   const pages = [];
   const xrefNums = new Set();
   for (const h of headers) {
-    const win = dictWindow(raw, h.start);
+    const win = dictWindow(raw, h.start, streamPos, endobjPos);
     if (/\/Type\s*\/XRef\b/.test(win)) { xrefNums.add(h.num); continue; }
     if (!/\/Type\s*\/Page\b/.test(win)) continue;
     let contents = [];
@@ -300,7 +329,11 @@ export function extractPdfWithStatus(buffer) {
   const headerRe = /(\d+)\s+(\d+)\s+obj\b/g;
   let hm;
   while ((hm = headerRe.exec(raw)) !== null) headers.push({ num: +hm[1], start: hm.index });
-  const { pages, xrefNums } = parsePageObjects(raw, headers);
+  // One linear pass each: the per-header dictWindow lookups below
+  // binary-search these instead of scanning forward per header.
+  const streamPos = collectNeedlePositions(raw, "\nstream");
+  const endobjPos = collectNeedlePositions(raw, "endobj");
+  const { pages, xrefNums } = parsePageObjects(raw, headers, streamPos, endobjPos);
 
   const chunks = [];
   const streamRec = new Map(); // objNum -> { ok, broken, empty, skippedImage }
@@ -336,7 +369,7 @@ export function extractPdfWithStatus(buffer) {
     catch { data = m[1]; inflateOk = false; }
     if (isXref) {
       xrefSeen.add(owner);
-      if (!inflateOk && /FlateDecode/.test(dictWindow(raw, headers[hi].start))) { xrefStatus = "failed"; xrefReason = "xref-stream-inflate-failed"; }
+      if (!inflateOk && /FlateDecode/.test(dictWindow(raw, headers[hi].start, streamPos, endobjPos))) { xrefStatus = "failed"; xrefReason = "xref-stream-inflate-failed"; }
       continue;
     }
     if (data.includes("Tj") || data.includes("TJ")) sawTextOperators = true;
