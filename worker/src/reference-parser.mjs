@@ -569,7 +569,59 @@ export function scanAuthorYearCitations(bodyText) {
     if (/\((?:19|20)\d{2}$/.test(stem)) return false;
     if (/,\s*(?:19|20)\d{2}$/.test(stem)) return false;
     if (/(?:19|20)\d{2}$/.test(stem)) return false;
-    return true;
+    // 2nd-citation fix (2026-11-03): the old code returned true here
+    // unconditionally, so ANY surname after &/and was a "second
+    // author" — including a NEW narrative citation after prose
+    // ("A et al. (2017) did X, and B et al. (2021)" lost B). Only
+    // treat it as a second author when what precedes &/and is a BARE
+    // author list still awaiting its year: walk back over surnames
+    // and separators; prose (a lowercase word) or "et al." (a closed
+    // group) means this is a new citation, not a co-author. Name
+    // particles are glued first ("van der Walt" walks as one
+    // surname); the walk never changes the scanned text.
+    let tail = stem.replace(/\b(?:de|der|den|van|von|le|la|di|du|ten|ter)\s+(?=[A-Z])/gi, "");
+    let sawSurname = false;
+    for (;;) {
+      const sm = tail.match(/[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s*$/u);
+      if (sm) { sawSurname = true; tail = tail.slice(0, sm.index).trimEnd(); continue; }
+      const pm = tail.match(/(?:&|and|,)\s*$/i);
+      if (pm) { tail = tail.slice(0, pm.index).trimEnd(); continue; }
+      break;
+    }
+    if (!sawSurname) {
+      // Damaged-name guard (429 mangling): extraction sometimes
+      // destroys a first author's initial ("Dielmann" -> control
+      // char -> normalised to lowercase "ielmann"), so the walk
+      // stops at a lowercase word. A lowercase word in NAME
+      // POSITION (start of string, or right after ; : ( [ , a year,
+      // or a separator) is plausibly that damaged surname — block
+      // the second author as before. A lowercase word mid-prose
+      // ("... dataset, and Sumer") is ordinary prose — the new
+      // citation still passes. Without this, the narrowed guard
+      // would emit false first-author keys ("hilbig, 2014") for
+      // every mangled "X and Hilbig" occurrence.
+      const lm = tail.match(/([a-z][\p{L}\p{M}\x80-\xFF'’\-]*)\s*$/u);
+      if (lm) {
+        const rest = tail.slice(0, lm.index).trimEnd();
+        if (rest === "" || /[;:\(\[]$/.test(rest) || /(?:19|20)\d{2}\)?$/.test(rest) || /,\s*(?:19|20)\d{2}$/.test(rest) || /(?:&|and|,)\s*$/.test(rest)) return true;
+      }
+    }
+    if (!sawSurname) {
+      // Et-al. gate (2nd-citation fix, layer 2): a candidate the
+      // walk calls a NEW citation is only trusted when it carries
+      // "et al." — the reported bug's form. A bare surname + year
+      // after prose + "and" whose first author is missing/damaged
+      // (mangled "ielmann and Hilbig (2014)") stays blocked, as
+      // before, instead of leaking a false first-author key. The
+      // year-end exemptions above are NOT gated: a closed citation
+      // before &/and already proves a new citation ("Venkatesh,
+      // 2003 and Davis, 1989" must still yield both). Residual,
+      // documented: single-author and pair-form narrative seconds
+      // after prose ("... did X, and Jones (2021)") stay blocked
+      // as before — same as old behaviour, not a regression.
+      if (!/^\S+\s+et\s+al\b/.test(text.slice(idx, idx + 80))) return true;
+    }
+    return sawSurname;
   };
   // A match starting right after "-" or an apostrophe is the tail
   // of a hyphenated surname ("Cwielag-Piasecka" yielding a false
@@ -685,7 +737,59 @@ export function scanAuthorYearCitationContexts(bodyText) {
     if (/\((?:19|20)\d{2}$/.test(stem)) return false;
     if (/,\s*(?:19|20)\d{2}$/.test(stem)) return false;
     if (/(?:19|20)\d{2}$/.test(stem)) return false;
-    return true;
+    // 2nd-citation fix (2026-11-03): the old code returned true here
+    // unconditionally, so ANY surname after &/and was a "second
+    // author" — including a NEW narrative citation after prose
+    // ("A et al. (2017) did X, and B et al. (2021)" lost B). Only
+    // treat it as a second author when what precedes &/and is a BARE
+    // author list still awaiting its year: walk back over surnames
+    // and separators; prose (a lowercase word) or "et al." (a closed
+    // group) means this is a new citation, not a co-author. Name
+    // particles are glued first ("van der Walt" walks as one
+    // surname); the walk never changes the scanned text.
+    let tail = stem.replace(/\b(?:de|der|den|van|von|le|la|di|du|ten|ter)\s+(?=[A-Z])/gi, "");
+    let sawSurname = false;
+    for (;;) {
+      const sm = tail.match(/[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s*$/u);
+      if (sm) { sawSurname = true; tail = tail.slice(0, sm.index).trimEnd(); continue; }
+      const pm = tail.match(/(?:&|and|,)\s*$/i);
+      if (pm) { tail = tail.slice(0, pm.index).trimEnd(); continue; }
+      break;
+    }
+    if (!sawSurname) {
+      // Damaged-name guard (429 mangling): extraction sometimes
+      // destroys a first author's initial ("Dielmann" -> control
+      // char -> normalised to lowercase "ielmann"), so the walk
+      // stops at a lowercase word. A lowercase word in NAME
+      // POSITION (start of string, or right after ; : ( [ , a year,
+      // or a separator) is plausibly that damaged surname — block
+      // the second author as before. A lowercase word mid-prose
+      // ("... dataset, and Sumer") is ordinary prose — the new
+      // citation still passes. Without this, the narrowed guard
+      // would emit false first-author keys ("hilbig, 2014") for
+      // every mangled "X and Hilbig" occurrence.
+      const lm = tail.match(/([a-z][\p{L}\p{M}\x80-\xFF'’\-]*)\s*$/u);
+      if (lm) {
+        const rest = tail.slice(0, lm.index).trimEnd();
+        if (rest === "" || /[;:\(\[]$/.test(rest) || /(?:19|20)\d{2}\)?$/.test(rest) || /,\s*(?:19|20)\d{2}$/.test(rest) || /(?:&|and|,)\s*$/.test(rest)) return true;
+      }
+    }
+    if (!sawSurname) {
+      // Et-al. gate (2nd-citation fix, layer 2): a candidate the
+      // walk calls a NEW citation is only trusted when it carries
+      // "et al." — the reported bug's form. A bare surname + year
+      // after prose + "and" whose first author is missing/damaged
+      // (mangled "ielmann and Hilbig (2014)") stays blocked, as
+      // before, instead of leaking a false first-author key. The
+      // year-end exemptions above are NOT gated: a closed citation
+      // before &/and already proves a new citation ("Venkatesh,
+      // 2003 and Davis, 1989" must still yield both). Residual,
+      // documented: single-author and pair-form narrative seconds
+      // after prose ("... did X, and Jones (2021)") stay blocked
+      // as before — same as old behaviour, not a regression.
+      if (!/^\S+\s+et\s+al\b/.test(text.slice(idx, idx + 80))) return true;
+    }
+    return sawSurname;
   };
   const startsMidToken = (idx) => /[-'’]$/.test(text.slice(0, idx));
   // Same guards as scanAuthorYearCitations, so the keys here match
