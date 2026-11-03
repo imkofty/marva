@@ -184,6 +184,13 @@ export default function App() {
     return () => document.removeEventListener("visibilitychange", onVis);
   }, []);
 
+  // 409 = the backend's one-active-job gate. The raw error embeds the
+  // backend route + JSON body; users get a plain sentence instead.
+  const startErrorMessage = (e, prefix) => {
+    if (e && e.status === 409) return "An audit is already running. Please wait until it finishes, then try again.";
+    return `${prefix}: ${e.message}`;
+  };
+
   const startPdf = async (file) => {
     if (!file) return;
     if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
@@ -210,7 +217,7 @@ export default function App() {
       saveHistory([entry, ...history]);
       pollJob(res.jobId);
     } catch (e) {
-      setNotice(`Upload failed: ${e.message}`);
+      setNotice(startErrorMessage(e, "Upload failed"));
     } finally {
       setBusy(false);
     }
@@ -236,7 +243,7 @@ export default function App() {
       saveHistory([entry, ...history]);
       pollJob(res.jobId);
     } catch (e) {
-      setNotice(`Start failed: ${e.message}`);
+      setNotice(startErrorMessage(e, "Start failed"));
     } finally {
       setBusy(false);
     }
@@ -371,6 +378,14 @@ export default function App() {
 
   const statuses = agentStatuses(events, jobStatus);
   const prog = progress(events);
+  // Rate-limit notice: the backend's own verifier event says when a
+  // batch hit the database limit ("backing off"). Only the latest
+  // verifier event counts: a later clean batch hides the notice.
+  const verifierEvents = events.filter((e) => e.stage === "reference_verifier");
+  const lastVerifier = verifierEvents[verifierEvents.length - 1];
+  const backoffMatch = lastVerifier && lastVerifier.status === "running"
+    ? /Checked (\d+)\/(\d+) references — verified: (\d+), flagged: (\d+), ambiguous: (\d+), inconclusive: (\d+).*backing off/.exec(lastVerifier.detail || "")
+    : null;
   // Bubbles: latest real events, mapped to their agent. The Narrator
   // (stage null) is excluded by construction — it never gets a bubble.
   const bubbles = events
@@ -529,6 +544,11 @@ export default function App() {
               </li>
             ))}
           </ul>
+          {backoffMatch && jobStatus === "running" && (
+            <div className="marva-notice" role="alert">
+              <strong>Reference verification paused — not failed.</strong> The external database (OpenAlex) is temporarily rate-limiting requests. Of {backoffMatch[2]} references: {backoffMatch[3]} verified, {backoffMatch[4]} flagged, {backoffMatch[5]} ambiguous, and {backoffMatch[6]} not yet checked because of the service limit — these are <strong>not</strong> invalid. The audit will resume automatically from the last position ({backoffMatch[1]}/{backoffMatch[2]}) without starting over. The final report will list them as not yet checked, not as invalid.
+            </div>
+          )}
           <p className="marva-meta">
             Progress is real stages finished / total stages. A ✓ stage
             finished successfully; a – stage finished skipped or failed

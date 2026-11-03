@@ -131,7 +131,9 @@ export async function createJobFromPdfBase64(pdfBase64) {
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`POST /jobs ${res.status}: ${text.slice(0, 300)}`);
+    const err = new Error(`POST /jobs ${res.status}: ${text.slice(0, 300)}`);
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
@@ -144,7 +146,9 @@ export async function createJobFromText(text) {
   });
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`POST /jobs ${res.status}: ${t.slice(0, 300)}`);
+    const err = new Error(`POST /jobs ${res.status}: ${t.slice(0, 300)}`);
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
