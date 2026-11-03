@@ -496,9 +496,8 @@ export default function App() {
             <span className="marva-meta"> — static frozen export of paper 435 (JSON), not a live job.</span>
           </p>
         </section>
-        </div>
 
-        <section className="marva-card marva-wide">
+        <section className="marva-card">
           <h2>Meeting Log: Brief</h2>
           {logLines.length === 0 ? (
             <p className="marva-meta">No events yet. Start an audit to see real agent events here.</p>
@@ -513,6 +512,7 @@ export default function App() {
             </ul>
           )}
         </section>
+        </div>
 
         <section className="marva-card marva-wide">
           <h2>Audit Progress</h2>
