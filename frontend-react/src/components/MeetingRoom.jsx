@@ -41,7 +41,7 @@ const EYE_GROUPS = [
 // with no job yet); running/done/skipped/failed keep their own labels.
 function statusLabel(code, jobStatus) {
   if (code === "waiting" || !code) {
-    return jobStatus == null ? "Idle — menunggu audit dimulai" : "Idle";
+    return jobStatus == null ? "Idle — waiting for an audit to start" : "Idle";
   }
   return code;
 }
