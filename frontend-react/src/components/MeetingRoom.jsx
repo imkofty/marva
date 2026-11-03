@@ -17,22 +17,22 @@ import { useEffect, useState } from "react";
 //     (1.8-5.2s apart, 220ms closed), so blinks look natural.
 
 const LAYERS = [
-  { id: "reader", label: "Reader", x: 34, y: 0, w: 271, h: 415, fur: "#7aa8e8" },
-  { id: "citation", label: "Citation Matcher", x: 273, y: 0, w: 214, h: 274, fur: "#8fd0b8" },
-  { id: "verifier", label: "Reference Verifier", x: 486, y: 0, w: 219, h: 231, fur: "#b8a8d8" },
-  { id: "gap", label: "Gap Assessor", x: 767, y: 0, w: 181, h: 161, fur: "#e8d88a" },
-  { id: "journal", label: "Journal Matcher", x: 943, y: 0, w: 177, h: 240, fur: "#e8b88a" },
-  { id: "supervisor", label: "Supervisor", x: 1024, y: 46, w: 304, h: 369, fur: "#d8cdb8" },
-  { id: "narrator", label: "Narrator", x: 683, y: 143, w: 353, h: 272, fur: "#666666" },
+  { id: "reader", label: "Reader", x: 25, y: 242, w: 271, h: 415, fur: "#7aa8e8" },
+  { id: "citation", label: "Citation Matcher", x: 264, y: 242, w: 214, h: 274, fur: "#8fd0b8" },
+  { id: "verifier", label: "Reference Verifier", x: 477, y: 242, w: 219, h: 231, fur: "#b8a8d8" },
+  { id: "gap", label: "Gap Assessor", x: 758, y: 242, w: 181, h: 161, fur: "#e8d88a" },
+  { id: "journal", label: "Journal Matcher", x: 934, y: 242, w: 177, h: 240, fur: "#e8b88a" },
+  { id: "supervisor", label: "Supervisor", x: 1015, y: 288, w: 304, h: 369, fur: "#d8cdb8" },
+  { id: "narrator", label: "Narrator", x: 674, y: 385, w: 353, h: 272, fur: "#666666" },
 ];
-const PW = 1373, PH = 478;
+const PW = 1330, PH = 665;
 const EYE_GROUPS = [
-  { id: "reader", skin: "#e8c6b2", eyes: [[203, 131], [250, 125]] },
-  { id: "citation", skin: "#eed2b9", eyes: [[399, 75], [441, 69]] },
-  { id: "verifier", skin: "#e1b4a5", eyes: [[583, 62], [636, 60]] },
-  { id: "gap", skin: "#dcaf7d", eyes: [[792, 66], [837, 69]] },
-  { id: "journal", skin: "#d4a076", eyes: [[964, 97], [1004, 101]] },
-  { id: "supervisor", skin: "#c89e7a", eyes: [[1117, 180], [1161, 173]] },
+  { id: "reader", skin: "#e8c6b2", eyes: [[194, 373], [241, 367]] },
+  { id: "citation", skin: "#eed2b9", eyes: [[390, 317], [432, 311]] },
+  { id: "verifier", skin: "#e1b4a5", eyes: [[574, 304], [627, 302]] },
+  { id: "gap", skin: "#dcaf7d", eyes: [[783, 308], [828, 311]] },
+  { id: "journal", skin: "#d4a076", eyes: [[955, 339], [995, 343]] },
+  { id: "supervisor", skin: "#c89e7a", eyes: [[1108, 422], [1152, 415]] },
 ];
 
 // Display label only — the internal status code ("waiting" etc. from
@@ -70,11 +70,6 @@ export default function MeetingRoom({ statuses, bubbles, live, jobStatus }) {
   return (
     <div className="marva-room-wrap">
       <div className="marva-photo-room">
-        {/* Headroom fix: the source crop puts hood tops flush at the
-            frame's top edge, so the whole composition is inset to 94%
-            (cream frame shows above the hoods; layer % coords unchanged
-            because the inner div is exactly the photo-room box). */}
-        <div className="marva-photo-inner">
         <img className="marva-photo-bg" src="/room.jpg" alt="MARVA live meeting room: seven agents at a round table" />
         {LAYERS.map((c, ci) => {
           const active = statuses[c.id] === "running" || statuses[c.id] === "typing";
@@ -113,7 +108,6 @@ export default function MeetingRoom({ statuses, bubbles, live, jobStatus }) {
             </div>
           ))
         )}
-        </div>
       </div>
       <div className="marva-room-bubbles">
         {bubbles.slice(-3).map((b, i) => (

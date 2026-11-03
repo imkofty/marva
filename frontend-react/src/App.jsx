@@ -400,6 +400,7 @@ export default function App() {
       {notice && <div className="marva-notice" role="alert">{notice}</div>}
 
       <main className="marva-grid">
+        <div className="marva-col">
         <section className="marva-card marva-upload">
           <h2>⬆ Upload PDF</h2>
           <div
@@ -471,7 +472,9 @@ export default function App() {
             Try synthetic demo
           </button>
         </section>
+        </div>
 
+        <div className="marva-col">
         <section className="marva-card marva-room-card">
           <div className="marva-room-head">
             <h2>Live Meeting Room — Pre-Submit Review Session</h2>
@@ -493,8 +496,9 @@ export default function App() {
             <span className="marva-meta"> — static frozen export of paper 435 (JSON), not a live job.</span>
           </p>
         </section>
+        </div>
 
-        <section className="marva-card">
+        <section className="marva-card marva-wide">
           <h2>Meeting Log: Brief</h2>
           {logLines.length === 0 ? (
             <p className="marva-meta">No events yet. Start an audit to see real agent events here.</p>
@@ -510,7 +514,7 @@ export default function App() {
           )}
         </section>
 
-        <section className="marva-card">
+        <section className="marva-card marva-wide">
           <h2>Audit Progress</h2>
           <p>
             {prog.pct}% ({prog.finishedCount} of {prog.total} stages finished)
@@ -548,7 +552,7 @@ export default function App() {
           </div>
         </section>
 
-        <section className="marva-card marva-report-card">
+        <section className="marva-card marva-report-card marva-wide">
           <h2>Report</h2>
           {report ? (
             <>
