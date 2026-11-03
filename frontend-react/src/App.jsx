@@ -395,12 +395,6 @@ export default function App() {
           <h1>MARVA</h1>
           <p>Meta Audit Review Verification for Authors</p>
         </div>
-        <div className="marva-header-icons">
-          <button aria-label="Notifications" title="Notifications">🔔</button>
-          <button aria-label="Help" title="Help">❔</button>
-          <div className="marva-avatar" title="Author">AD</div>
-          <span aria-hidden="true">▾</span>
-        </div>
       </header>
 
       {notice && <div className="marva-notice" role="alert">{notice}</div>}

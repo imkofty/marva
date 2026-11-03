@@ -9,9 +9,6 @@
 .marva-header h1 { font-size: 30px; letter-spacing: 0.02em; margin: 0; }
 .marva-header p { margin: 0; color: #666; font-size: 14px; }
 .marva-logo { font-size: 38px; }
-.marva-header-icons { margin-left: auto; display: flex; align-items: center; gap: 14px; }
-.marva-header-icons button { background: none; border: none; font-size: 22px; cursor: pointer; }
-.marva-avatar { width: 40px; height: 40px; border-radius: 50%; background: #a8b8d8; color: #fff; display: grid; place-items: center; font-weight: 700; }
 .marva-notice { margin: 14px 24px 0; padding: 10px 14px; background: #fff3cd; border: 1px solid #e6c87a; border-radius: 10px; font-size: 14px; }
 .marva-grid { display: grid; grid-template-columns: 320px 1fr; gap: 24px; padding: 16px 24px 32px; align-items: start; }
 .marva-room-card { align-self: start; }
@@ -149,9 +146,6 @@
   .marva-room-labels-bar { flex-wrap: wrap; overflow: visible; font-size: 10px; gap: 4px 6px; }
   .marva-room-labels-bar span { flex-shrink: 0; padding: 1px 5px; }
   .marva-header > div:nth-child(2) { flex: 1; min-width: 0; }
-  .marva-header-icons { gap: 8px; flex-shrink: 0; margin-left: 0; }
-  .marva-header-icons button { font-size: 18px; }
-  .marva-avatar { width: 32px; height: 32px; }
   .marva-room { height: 380px; }
   .marva-actions .marva-btn { width: 100%; box-sizing: border-box; }
   .marva-room-bubbles { position: static; margin-top: 8px; display: flex; flex-direction: column; gap: 6px; pointer-events: auto; }
