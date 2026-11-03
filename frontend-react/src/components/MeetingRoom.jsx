@@ -108,6 +108,8 @@ export default function MeetingRoom({ statuses, bubbles, live, jobStatus }) {
             </div>
           ))
         )}
+      </div>
+      <div className="marva-room-bubbles">
         {bubbles.slice(-3).map((b, i) => (
           <div key={`${b.agentId}-${i}`} className="marva-bubble marva-sprite-bubble">
             <strong>{b.agentLabel}:</strong> {b.detail}
