@@ -390,7 +390,7 @@ export default function App() {
   return (
     <div className="marva-app">
       <header className="marva-header">
-        <div className="marva-logo">🐻</div>
+        <img className="marva-logo" src="/favicon.svg" alt="MARVA logo" width="44" height="44" />
         <div>
           <h1>MARVA</h1>
           <p>Meta Audit Review Verification for Authors</p>
