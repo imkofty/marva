@@ -70,6 +70,11 @@ export default function MeetingRoom({ statuses, bubbles, live, jobStatus }) {
   return (
     <div className="marva-room-wrap">
       <div className="marva-photo-room">
+        {/* Headroom fix: the source crop puts hood tops flush at the
+            frame's top edge, so the whole composition is inset to 94%
+            (cream frame shows above the hoods; layer % coords unchanged
+            because the inner div is exactly the photo-room box). */}
+        <div className="marva-photo-inner">
         <img className="marva-photo-bg" src="/room.jpg" alt="MARVA live meeting room: seven agents at a round table" />
         {LAYERS.map((c, ci) => {
           const active = statuses[c.id] === "running" || statuses[c.id] === "typing";
@@ -108,6 +113,7 @@ export default function MeetingRoom({ statuses, bubbles, live, jobStatus }) {
             </div>
           ))
         )}
+        </div>
       </div>
       <div className="marva-room-bubbles">
         {bubbles.slice(-3).map((b, i) => (
