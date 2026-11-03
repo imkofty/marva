@@ -1,11 +1,39 @@
 // Deterministic citation matcher — no model, no guessing.
 // Copied verbatim in logic from backend/src/lib/citation-matcher.mjs.
-// Matching is exact after normalising case and whitespace only; fuzzy
-// matching is deliberately NOT done, because a near-match presented as
-// a match would be a fabricated verification.
+// Matching is exact after normalising case and whitespace, plus two
+// deterministic equivalence rules (never similarity scoring, so a
+// near-match is never presented as a match):
+//  - diacritic folding: "Sümer" and "Sumer" are the same surname with
+//    and without the diacritic (NFD + strip combining marks);
+//  - bare<->compound surname bridge: a cited bare form for a listed
+//    compound surname ("Youssef" for "Ben-Youssef", "Souza" for
+//    "De Souza", "Bank" for "World Bank").
+// Both rules still require the year to match, and an ambiguous
+// candidate set stays flagged for the author, never silently assigned
+// to one entry. A cited variant of a work already claimed under its
+// full/variant spelling is satisfied, not missing: prose "Sumer" +
+// table "Sümer" citing the one listed "Sumer, 2021" is one cited
+// work, and the same holds for prose "Ben-Youssef" + table "Youssef".
+// Diacritic folding does NOT cover letters that do not decompose
+// under NFD (ø, ß, ł) — a documented limit, not a silent guess.
 export function normalizeKey(key) {
-  return String(key).trim().toLowerCase().replace(/\s+/g, " ");
+  return String(key).trim().toLowerCase().replace(/\s+/g, " ")
+    // Possessive normalisation (429 wart, 2026-11-03): "McAllister's
+    // (1995)" extracts as "mcallister\x92s, 1995" (\x92 = mangled U+2019)
+    // and falsely reports missing against listed "mcallister, 1995".
+    // Strip a trailing 's (ASCII ', U+2018, U+2019, mangled \x92) when
+    // followed by a separator or end-of-string. Internal apostrophes
+    // are untouched ("O'Kane" ends in "e", not "'s"), and a bare
+    // trailing "s" without an apostrophe is never stripped ("Davis"
+    // stays "Davis"). Applied here so cited AND listed keys normalise
+    // identically before any comparison.
+    .replace(/['\u2018\u2019\x92]s(?=[\s,&]|$)/g, "");
 }
+
+// Diacritic folding for comparison only (displayed keys keep their
+// original spelling): NFD splits "ü" into "u" + combining diaeresis,
+// which is then stripped, so "sümer" and "sumer" compare equal.
+const foldDiacritics = (s) => String(s).normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 
 // Deterministic author-year key for a reference-list entry. Reader
 // returns full reference strings ("Davis, 1989. Perceived usefulness..."),
@@ -22,21 +50,29 @@ export function extractReferenceKey(ref) {
   return normalizeKey(cleaned);
 }
 
-// Author-year matching with one deterministic variant rule, on top of
-// exact matching: a cited surname that equals the LAST word of a
-// listed surname (same year) counts as that entry. This covers the
-// paper's own variants — text cites "Souza" for listed "De Souza",
-// "Costa" for listed "Da Silva Costa", "Bank" for listed
-// "World Bank" — without fuzzy similarity: the year must match, and
-// if two listed entries share the same last word + year, the cited
-// key stays unmatched (ambiguous, flagged for the author, never
-// silently assigned to one of them).
+// Author-year matching with deterministic variant rules, on top of
+// exact matching:
+//  - a cited surname that equals the LAST segment of a listed surname
+//    (same year) counts as that entry. This covers the paper's own
+//    variants — text cites "Souza" for listed "De Souza",
+//    "Costa" for listed "Da Silva Costa", "Bank" for listed
+//    "World Bank", "Youssef" for listed "Ben-Youssef" — without fuzzy
+//    similarity: the year must match, and if two listed entries share
+//    the same segment + year, the cited key stays unmatched (ambiguous,
+//    flagged for the author, never silently assigned to one of them).
+//    The bridge is bare<->compound ONLY: two hyphenated surnames
+//    sharing a trailing segment ("Smith-Jones" vs "Brown-Jones") do
+//    NOT match — that would be guessing, not reconciling.
+//  - diacritic folding (see foldDiacritics): "Sümer" for "Sumer".
+//  - an already-claimed candidate satisfies the citation when no
+//    unclaimed candidate exists: the work is listed, it was just
+//    already claimed under its full/variant spelling.
 // A listed entry's matching surname is its FIRST author only: the parser
 // keeps the full author string as the key ("herawati et al., 2021",
 // "li & cai, 2021"), while body citations are keyed by first author
 // ("herawati, 2021", "li, 2021"). Without this reduction the 20-paper
 // test's Agriculture paper reported 50 missing from only 17 references.
-// The last-word fallback below still covers "De Souza" cited as "Souza"
+// The segment fallback below still covers "De Souza" cited as "Souza"
 // and "World Bank" cited as "Bank". Displayed missing/uncited lists
 // always use the ORIGINAL keys, never the reduced ones.
 const matchSurname = (key) => {
@@ -81,7 +117,7 @@ export function resolveIbidKeys(keys) {
       continue;
     }
     if (OPCIT_LIST_KEY_RE.test(key)) {
-      const cands = out.filter((l) => matchSurname(l) === surname);
+      const cands = out.filter((l) => foldDiacritics(matchSurname(l)) === foldDiacritics(surname));
       out.push(cands.length === 1 ? cands[0] : key);
       prevSurname = surname;
       continue;
@@ -101,8 +137,15 @@ export function matchAuthorYearKeys(inText, referenceList) {
   const listed = resolveIbidKeys(referenceList.map(normalizeKey));
   const yearOf = (key) => (key.split(",")[1] || "").trim();
   const matchKey = (key) => `${matchSurname(key)}, ${yearOf(key)}`;
+  const foldKey = (key) => `${foldDiacritics(matchSurname(key))}, ${yearOf(key)}`;
+  // Trailing segment of a surname after whitespace AND hyphens:
+  // "ben-youssef" -> "youssef", "de souza" -> "souza".
+  const lastSeg = (surname) => {
+    const parts = foldDiacritics(surname).split(/[\s-]+/).filter(Boolean);
+    return parts[parts.length - 1];
+  };
   const lastWord = (surname) => {
-    const words = surname.split(/\s+/);
+    const words = foldDiacritics(surname).split(/\s+/);
     return words[words.length - 1];
   };
   const matchedListed = new Set();
@@ -130,16 +173,45 @@ export function matchAuthorYearKeys(inText, referenceList) {
       if (new Set(exact).size === 1) { matchedListed.add(exact[0]); continue; }
       missing.push(c); ambiguous.push({ cited: c, candidates: exact }); continue;
     }
-    const cands = listed.filter((l) => !matchedListed.has(l) && yearOf(l) === yearOf(c) && lastWord(matchSurname(l)) === lastWord(matchSurname(c)) && matchSurname(l) !== matchSurname(c));
-    if (cands.length === 1) matchedListed.add(cands[0]);
-    else {
-      missing.push(c);
-      if (cands.length > 1) ambiguous.push({ cited: c, candidates: cands });
+    // Folded exact: same work cited with/without diacritics ("Sümer"
+    // for listed "Sumer"). Unfolded exact above runs first, so two
+    // listed entries differing ONLY by diacritic still resolve to the
+    // spelled one; folding only fires when no unfolded match exists.
+    // A single distinct folded candidate that is already claimed
+    // satisfies the citation too (variant re-citation, see header).
+    const fexact = listed.filter((l) => foldKey(l) === foldKey(c));
+    const fdistinct = [...new Set(fexact)];
+    if (fdistinct.length === 1) {
+      if (!matchedListed.has(fexact[0])) matchedListed.add(fexact[0]);
+      continue;
     }
+    if (fdistinct.length > 1) { missing.push(c); ambiguous.push({ cited: c, candidates: fdistinct }); continue; }
+    // Segment fallback (bare<->compound + last-word, folded): same
+    // year, and the cited surname either equals the listed surname's
+    // trailing segment or vice versa, or shares its last word.
+    // Unclaimed unique candidate -> claim it. No unclaimed candidate
+    // but an already-claimed one -> satisfied (same work, claimed
+    // under its full/variant spelling). Multiple unclaimed -> missing
+    // + ambiguous, never assigned.
+    const segC = lastSeg(matchSurname(c));
+    const foldC = foldDiacritics(matchSurname(c));
+    const isSegCand = (l) => {
+      if (yearOf(l) !== yearOf(c)) return false;
+      const sL = foldDiacritics(matchSurname(l));
+      if (sL === foldC) return false; // handled by the exact steps above
+      if (lastWord(matchSurname(l)) === lastWord(matchSurname(c))) return true;
+      return foldC === lastSeg(matchSurname(l)) || sL === segC;
+    };
+    const unclaimed = listed.filter((l) => !matchedListed.has(l) && isSegCand(l));
+    const claimed = listed.filter((l) => matchedListed.has(l) && isSegCand(l));
+    if (unclaimed.length === 1) { matchedListed.add(unclaimed[0]); continue; }
+    if (unclaimed.length === 0 && claimed.length >= 1) continue;
+    missing.push(c);
+    if (unclaimed.length > 1) ambiguous.push({ cited: c, candidates: unclaimed });
   }
   for (const mk of markers) {
     const surname = matchSurname(mk);
-    const sameSurname = listed.filter((l) => matchSurname(l) === surname);
+    const sameSurname = listed.filter((l) => foldDiacritics(matchSurname(l)) === foldDiacritics(surname));
     const unclaimed = sameSurname.filter((l) => !matchedListed.has(l));
     if (sameSurname.length === 0) { missing.push(mk); continue; }
     if (sameSurname.some((l) => matchedListed.has(l))) continue; // satisfied by a full citation

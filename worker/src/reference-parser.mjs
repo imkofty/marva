@@ -36,6 +36,33 @@
 //  - superscript: numbers wrapped in \u0001...\u0002 by pdf.mjs only.
 //    Bare numbers in plain text are never scanned as citations.
 
+// Sentence-initial discourse adverbs are NEVER authors (429 wart, 2026-11-03):
+// "Interestingly, Tan and Tan (2000)" was scanned as "interestingly, 2000"
+// two ways at once — the three-author pattern re6 read the adverb as a
+// first author, and precededBySurnameComma read "Interestingly, " as
+// "Surname, ", which blocked the true "Tan and Tan (2000)" match.
+// The set holds only unambiguous discourse markers: no entry is a
+// plausible surname (Long, Young, Still, Well are deliberately absent),
+// so rejecting a captured first author in this set cannot drop a real
+// citation. Applied to the captured first author of all six patterns
+// in both scan functions, and as an exemption inside
+// precededBySurnameComma, so the true citation author wins.
+const SENTENCE_ADVERBS = new Set([
+  "accordingly", "additionally", "admittedly", "alternatively", "amazingly",
+  "astonishingly", "clearly", "consequently", "conversely", "crucially",
+  "curiously", "essentially", "evidently", "finally", "firstly",
+  "fortunately", "furthermore", "happily", "hopefully", "however",
+  "importantly", "initially", "interestingly", "ironically", "lastly",
+  "meanwhile", "moreover", "nevertheless", "nonetheless", "notably",
+  "obviously", "originally", "paradoxically", "practically",
+  "predictably", "previously", "realistically", "recently", "regrettably",
+  "remarkably", "revealingly", "sadly", "secondly", "significantly",
+  "similarly", "strikingly", "subsequently", "surprisingly", "thankfully",
+  "thirdly", "ultimately", "understandably", "unfortunately",
+  "unsurprisingly", "worryingly",
+]);
+const isSentenceAdverb = (word) => SENTENCE_ADVERBS.has(String(word).toLowerCase());
+
 // Reference-section headings, beyond English. Longest forms first:
 // alternation tries left to right, so "Literaturverzeichnis" must
 // precede "Literatur" or the match would start mid-word. Boundaries
@@ -82,8 +109,41 @@ export function stripMarkerChars(s) {
   return String(s || "").replace(/|/g, "");
 }
 
+function stripMdpiFooter(e) {
+  // Shape 2: MDPI publisher boilerplate glued to the last entry.
+  // The MDPI mention guards against cutting a hypothetical real
+  // sentence that merely contains the word "Disclaimer".
+  const disc = e.indexOf("Disclaimer/Publisher's Note:");
+  if (disc >= 0 && e.slice(disc).includes("MDPI")) return e.slice(0, disc).trim();
+  // Shape 1: footer DOI + journal + year/vol/article + "N of M".
+  // Start from the LAST doi.org match: an entry could in theory
+  // carry its own DOI before the footer, and only the footer tail
+  // may go. The tail must match the full footer shape — a genuine
+  // entry DOI is never followed by "N of M".
+  const re = /(?:https?:\/\/)?doi\.org\/10\.\d{4,9}\/\S+/g;
+  let last = null, m;
+  while ((m = re.exec(e)) !== null) last = m;
+  if (!last) return e;
+  const tail = e.slice(last.index);
+  if (/^(?:https?:\/\/)?doi\.org\/10\.\d{4,9}\/\S+\s+.+\s\d{4}\s*,\s*\d+\s*,\s*\S+\s+\d+ of \d+$/.test(tail)) {
+    return e.slice(0, last.index).trim();
+  }
+  return e;
+}
+
 function cleanEntry(s) {
   let e = String(s || "").replace(/\s+/g, " ").trim();
+  // Strip an MDPI page footer glued to the end of the entry (papers
+  // 336/443, 2026-11-03): the extractor concatenates page footers
+  // into the references zone, and a footer landing between two
+  // markers is glued to the preceding entry. The footer carries the
+  // HOST paper's DOI, and the verifier's extractDOI takes the first
+  // DOI in the entry text — so the host DOI verified 5 unrelated
+  // entries in each paper, and the journal stage named the host
+  // journal off that artefact. Strip BEFORE the CrossRef/PubMed
+  // trim: the footer follows "[ CrossRef ]", so the token is only
+  // trailing once the footer is gone.
+  e = stripMdpiFooter(e);
   // Strip trailing CrossRef / PubMed tokens (repeated at entry ends).
   e = e.replace(/(?:\s*\[?(?:CrossRef|PubMed)\]?)+$/i, "").trim();
   // Strip a page-footer artefact glued to the end ("...444432of35").
@@ -519,7 +579,13 @@ export function scanAuthorYearCitations(bodyText) {
   // author list, not its own citation: in "Meng, Cheng & Li,
   // 2024" the pair rule below would otherwise emit a false
   // "cheng, 2024" while the true first author (Meng) is missed.
-  const precededBySurnameComma = (str, idx) => /[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+,\s*$/u.test(str.slice(0, idx).trimEnd());
+  const precededBySurnameComma = (str, idx) => {
+    const mm = str.slice(0, idx).trimEnd().match(/([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+),\s*$/u);
+    if (!mm) return false;
+    // 429 wart: "Interestingly, " is an adverb, not "Surname, " — it must
+    // not block the true citation that follows ("Tan and Tan (2000)").
+    return !isSentenceAdverb(mm[1]);
+  };
   // Page-footer citation: the paper's own footer ("Setyawan et
   // al. (2026), PeerJ, DOI 10.7717/... 16/22") repeats on every
   // page; scanned as a citation it becomes a false "missing" for
@@ -528,25 +594,25 @@ export function scanAuthorYearCitations(bodyText) {
   const isFooterCite = (str, end) => /^\s*,?\s*[A-Z][A-Za-z .&'’\-]{0,40}?,?\s*DOI\s+10\./.test(str.slice(end, end + 80).replace(/\s+/g, " "));
   const re1 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+)(?:\s+et\s+al\.?)?\s*,\s*((?:19|20)\d{2})\b/gu;
   let m;
-  while ((m = re1.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(text, m.index) && !isFooterCite(text, m.index + m[0].length)) push(m[1], m[2]); }
+  while ((m = re1.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(text, m.index) && !isFooterCite(text, m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2]); }
   const re2 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+)(?:\s+et\s+al\.?)?\s*\(\s*((?:19|20)\d{2})\s*\)/gu;
-  while ((m = re2.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(text, m.index) && !isFooterCite(text, m.index + m[0].length)) push(m[1], m[2]); }
+  while ((m = re2.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(text, m.index) && !isFooterCite(text, m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2]); }
   // APA two-author citations: only the FIRST author keys the entry,
   // so "(Serra & Kunc, 2015)" and "Serra and Kunc (2015)" must yield
   // "serra, 2015", not "kunc, 2015" (which would false-flag both ways).
   const re3 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+)\s+(?:&|and)\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s*,\s*((?:19|20)\d{2})\b/gu;
-  while ((m = re3.exec(bodyText)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(bodyText, m.index) && !precededBySurnameComma(bodyText, m.index) && !isFooterCite(bodyText, m.index + m[0].length)) push(m[1], m[2]); }
+  while ((m = re3.exec(bodyText)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(bodyText, m.index) && !precededBySurnameComma(bodyText, m.index) && !isFooterCite(bodyText, m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2]); }
   const re4 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+)\s+(?:&|and)\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s*\(\s*((?:19|20)\d{2})\s*\)/gu;
-  while ((m = re4.exec(bodyText)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(bodyText, m.index) && !precededBySurnameComma(bodyText, m.index) && !isFooterCite(bodyText, m.index + m[0].length)) push(m[1], m[2]); }
+  while ((m = re4.exec(bodyText)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(bodyText, m.index) && !precededBySurnameComma(bodyText, m.index) && !isFooterCite(bodyText, m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2]); }
   // Three-author citations: "Meng, Cheng & Li, 2024" and
   // "Asadabadi, Hage-Ahmed & Steinkellner (2021)" must yield the
   // FIRST author only ("meng, 2024", "asadabadi, 2021"). The
   // middle-author guard also applies here, so a 4-author list
   // ("A, B, C & D, year") yields no key rather than a wrong one.
   const re5 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+),\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s+(?:&|and)\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s*,\s*((?:19|20)\d{2})\b/gu;
-  while ((m = re5.exec(bodyText)) !== null) { if (!startsMidToken(bodyText, m.index) && !precededBySurnameComma(bodyText, m.index) && !isFooterCite(bodyText, m.index + m[0].length)) push(m[1], m[2]); }
+  while ((m = re5.exec(bodyText)) !== null) { if (!startsMidToken(bodyText, m.index) && !precededBySurnameComma(bodyText, m.index) && !isFooterCite(bodyText, m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2]); }
   const re6 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+),\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s+(?:&|and)\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s*\(((?:19|20)\d{2})\)/gu;
-  while ((m = re6.exec(bodyText)) !== null) { if (!startsMidToken(bodyText, m.index) && !precededBySurnameComma(bodyText, m.index) && !isFooterCite(bodyText, m.index + m[0].length)) push(m[1], m[2]); }
+  while ((m = re6.exec(bodyText)) !== null) { if (!startsMidToken(bodyText, m.index) && !precededBySurnameComma(bodyText, m.index) && !isFooterCite(bodyText, m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2]); }
   // Op. cit. body citations: "Smith, op. cit." cites Smith's earlier
   // work, but carries no year, so the year-based patterns above miss
   // it entirely and the listed work falsely reports as uncited. Emit
@@ -625,21 +691,25 @@ export function scanAuthorYearCitationContexts(bodyText) {
   // Same guards as scanAuthorYearCitations, so the keys here match
   // that scan exactly: middle-author suppression for 3-author
   // lists, and page-footer citations (", Journal, DOI 10.") skipped.
-  const precededBySurnameComma = (idx) => /[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+,\s*$/u.test(text.slice(0, idx).trimEnd());
+  const precededBySurnameComma = (idx) => {
+    const mm = text.slice(0, idx).trimEnd().match(/([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+),\s*$/u);
+    if (!mm) return false;
+    return !isSentenceAdverb(mm[1]);
+  };
   const isFooterCite = (end) => /^\s*,?\s*[A-Z][A-Za-z .&'’\-]{0,40}?,?\s*DOI\s+10\./.test(text.slice(end, end + 80).replace(/\s+/g, " "));
   let m;
   const re1 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+)(?:\s+et\s+al\.?)?\s*,\s*((?:19|20)\d{2})\b/gu;
-  while ((m = re1.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(m.index) && !isFooterCite(m.index + m[0].length)) push(m[1], m[2], m.index, m[0].length); }
+  while ((m = re1.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(m.index) && !isFooterCite(m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2], m.index, m[0].length); }
   const re2 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+)(?:\s+et\s+al\.?)?\s*\(\s*((?:19|20)\d{2})\s*\)/gu;
-  while ((m = re2.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(m.index) && !isFooterCite(m.index + m[0].length)) push(m[1], m[2], m.index, m[0].length); }
+  while ((m = re2.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(m.index) && !isFooterCite(m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2], m.index, m[0].length); }
   const re3 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+)\s+(?:&|and)\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s*,\s*((?:19|20)\d{2})\b/gu;
-  while ((m = re3.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(m.index) && !precededBySurnameComma(m.index) && !isFooterCite(m.index + m[0].length)) push(m[1], m[2], m.index, m[0].length); }
+  while ((m = re3.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(m.index) && !precededBySurnameComma(m.index) && !isFooterCite(m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2], m.index, m[0].length); }
   const re4 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+)\s+(?:&|and)\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s*\(\s*((?:19|20)\d{2})\s*\)/gu;
-  while ((m = re4.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(m.index) && !precededBySurnameComma(m.index) && !isFooterCite(m.index + m[0].length)) push(m[1], m[2], m.index, m[0].length); }
+  while ((m = re4.exec(text)) !== null) { if (!isSecondAuthor(m.index) && !startsMidToken(m.index) && !precededBySurnameComma(m.index) && !isFooterCite(m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2], m.index, m[0].length); }
   const re5 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+),\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s+(?:&|and)\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s*,\s*((?:19|20)\d{2})\b/gu;
-  while ((m = re5.exec(text)) !== null) { if (!startsMidToken(m.index) && !precededBySurnameComma(m.index) && !isFooterCite(m.index + m[0].length)) push(m[1], m[2], m.index, m[0].length); }
+  while ((m = re5.exec(text)) !== null) { if (!startsMidToken(m.index) && !precededBySurnameComma(m.index) && !isFooterCite(m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2], m.index, m[0].length); }
   const re6 = /\b([A-Z][\p{L}\p{M}\x80-\xFF'’\-]+),\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s+(?:&|and)\s+[A-Z][\p{L}\p{M}\x80-\xFF'’\-]+\s*\(((?:19|20)\d{2})\)/gu;
-  while ((m = re6.exec(text)) !== null) { if (!startsMidToken(m.index) && !precededBySurnameComma(m.index) && !isFooterCite(m.index + m[0].length)) push(m[1], m[2], m.index, m[0].length); }
+  while ((m = re6.exec(text)) !== null) { if (!startsMidToken(m.index) && !precededBySurnameComma(m.index) && !isFooterCite(m.index + m[0].length) && !isSentenceAdverb(m[1])) push(m[1], m[2], m.index, m[0].length); }
   return out;
 }
 
