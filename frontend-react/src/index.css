@@ -19,6 +19,11 @@
 .marva-report-card { grid-column: span 2; }
 .marva-card h2 { font-size: 20px; margin: 0 0 12px; }
 .marva-card h3 { font-size: 16px; margin: 18px 0 6px; }
+.marva-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 12px 0; }
+.marva-stat { background: #f6f3ee; border: 1px solid #e5e0d8; border-radius: 12px; padding: 12px; }
+.marva-stat strong { display: block; font-size: 26px; color: #2b5ea6; line-height: 1.2; }
+.marva-stat span { font-size: 13px; color: #555; }
+@media (max-width: 800px) { .marva-stats { grid-template-columns: 1fr; } }
 .marva-meta { color: #444; font-size: 14px; }
 .marva-small { font-size: 13px; }
 .marva-drop { border: 2px dashed #c8c2b8; border-radius: 14px; padding: 22px 12px; text-align: center; }

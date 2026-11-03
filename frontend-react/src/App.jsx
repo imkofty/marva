@@ -501,11 +501,11 @@ export default function App() {
         <section className="marva-card">
           <h2>Verified results</h2>
           <p className="marva-meta">Static numbers from a frozen export — this panel runs no live job.</p>
-          <ul>
-            <li><strong>20/20</strong> test papers verified live.</li>
-            <li>Paper 435, keyed case: inconclusive <strong>12 → 0</strong> after the OpenAlex key was installed.</li>
-            <li>Journals <strong>0</strong> — stated plainly, not mysteriously empty: only <strong>1</strong> verified reference (Microorganisms), below the naming threshold of <strong>2</strong>, so no journal is named.</li>
-          </ul>
+          <div className="marva-stats">
+            <div className="marva-stat"><strong>20/20</strong><span>test papers verified live</span></div>
+            <div className="marva-stat"><strong>12 → 0</strong><span>paper 435 inconclusive after the OpenAlex key was installed</span></div>
+            <div className="marva-stat"><strong>0</strong><span>journals named — only 1 verified reference (Microorganisms), below the naming threshold of 2</span></div>
+          </div>
           <p>
             <a href="/contoh-laporan-435.json">View sample report</a>
             <span className="marva-meta"> — static frozen export of paper 435 (JSON), not a live job.</span>
