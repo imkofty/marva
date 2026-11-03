@@ -31,7 +31,8 @@ detail panels. No plagiarism percentage anywhere.
 - Frontend: Cloudflare Pages, project `marva`
   (live at marva-dil.pages.dev).
 - Backend: Cloudflare Worker `marva-backend-worker`
-  (live at marva-backend-worker.imkofty.workers.dev), KV job state.
+  (live at marva-backend-worker.imkofty.workers.dev), Durable Object
+  job state (one Durable Object per job, SQLite inside).
 - The frontend's API base defaults to the live Worker; `VITE_API_BASE`
   overrides it at build time. There is no fallback to any other host.
 
@@ -45,13 +46,12 @@ detail panels. No plagiarism percentage anywhere.
   pipeline, same honesty rules. Reference only; it is not the live
   backend. Tests 4/4 pass.
 - `worker/` — Cloudflare Worker, the LIVE backend. Step-wise pipeline:
-  `POST /jobs` runs the Reader only; each `GET /jobs/:id/events`
-  poll advances exactly one stage (the Cloudflare `waitUntil`
-  30-second cap kills a 7-stage job, so it is never used for the
-  pipeline). Endpoints: `POST /jobs`, `GET /jobs/:id`,
+  the pipeline runs alarm-driven inside a Durable Object per job;
+  `GET /jobs/:id/events` is read-only and re-arms a missing or
+  past-due alarm. Endpoints: `POST /jobs`, `GET /jobs/:id`,
   `GET /jobs/:id/events`, `GET /jobs/:id/report.json`,
   `/report.html`, `/report.pdf`, `POST /jobs/:id/confirm`,
-  `DELETE /jobs/:id`, `GET /demo/synthetic`. Tests 10/10 pass.
+  `DELETE /jobs/:id`, `GET /demo/synthetic`. Tests 139/139 pass.
   - Agents: Reader, Citation Matcher, Reference Verifier, Gap Assessor,
     Journal Matcher, Supervisor + Report Builder, Narrator (silent).
   - Citation pipeline (deterministic code, never a model): the PDF
