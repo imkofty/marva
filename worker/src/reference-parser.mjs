@@ -270,11 +270,20 @@ function parseAuthorYearZone(zone) {
         // entries whose author part has no letter at all (a bare
         // "(1)" or number) or is literally "et al.", and years beyond
         // next year (a misread volume/page, not a publication year).
-        const sName = (currentSurname || "").trim().toLowerCase();
-        const plausible = year && currentSurname
+        // Artefact guard (live audit, 2026-11-03): a dash glued to a
+        // surname ("-Snow, N." from a wrapped author list) must not
+        // become key "-snow", and a bare article ("the, 2026" from a
+        // title fragment) is never an author. Strip leading dashes /
+        // bullets, then drop bare articles. Multi-word org names
+        // ("The World Bank") are untouched: only the bare word is
+        // rejected, and no real surname equals an article.
+        const cleanSurname = (currentSurname || "").trim().replace(/^[-–—•*]+\s*/, "");
+        const sName = cleanSurname.toLowerCase();
+        const plausible = year && cleanSurname
           && /[a-zà-ÿ]/.test(sName) && sName !== "et al." && sName !== "et al"
+          && sName !== "the" && sName !== "a" && sName !== "an"
           && Number(year) <= new Date().getFullYear() + 1;
-        if (plausible) entries.push({ text: current, key: `${currentSurname.trim().toLowerCase()}, ${year}` });
+        if (plausible) entries.push({ text: current, key: `${sName}, ${year}` });
       }
     }
     current = null;
